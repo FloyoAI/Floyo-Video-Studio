@@ -5,8 +5,8 @@
  * the GPU execution backend can find it. This file only ADDS the extras:
  *   • a dual-handle TIME range slider that shows BOTH the timestamp AND the
  *     frame number live (frame count matters for video models), driving the
- *     start_seconds / end_seconds widgets;
- *   • a playable in-node preview that scrubs to the start / end frame as you drag.
+ *     start_seconds / end_seconds widgets, and scrubbing the platform's own
+ *     preview video to the start / end frame as you drag (no duplicate preview).
  *
  * Network calls go through ComfyUI's `api` helper so they resolve through the
  * hosted proxy. No global observers/timers — per-node setup only, all wrapped in
@@ -55,15 +55,18 @@ function getWidget(node, name) {
     return (node.widgets || []).find((w) => w.name === name);
 }
 
-// Parse a ComfyUI annotated filename ("subfolder/name [input]") into a /view URL.
-function viewURL(value) {
-    let v = String(value || ""), type = "input", sub = "";
-    const m = v.match(/^(.*) \[(\w+)\]$/);
-    if (m) { v = m[1]; type = m[2]; }
-    const parts = v.split("/");
-    const fn = parts.pop();
-    sub = parts.join("/");
-    return api.apiURL(`/view?filename=${encodeURIComponent(fn)}&type=${type}&subfolder=${encodeURIComponent(sub)}&t=${Date.now()}`);
+// The platform's video_upload widget renders its own <video> preview as a DOM
+// sibling of our wrap. Find it so we can scrub it when the trim handles move.
+function frontendVideo(state) {
+    try {
+        let root = state.wrap && state.wrap.parentElement;
+        for (let i = 0; i < 6 && root; i++) {
+            const v = root.querySelector && root.querySelector("video");
+            if (v) return v;
+            root = root.parentElement;
+        }
+    } catch (_) {}
+    return null;
 }
 
 function setup(node) {
@@ -79,17 +82,10 @@ function setup(node) {
 
         const wrap = document.createElement("div");
         wrap.className = "fvs-wrap";
-
-        // ── Preview (playable, scrubs to start/end on drag) ──
-        const preview = document.createElement("video");
-        preview.className = "fvs-preview";
-        preview.muted = true;
-        preview.controls = true;
-        preview.playsInline = true;
-        preview.preload = "auto";
-        preview.setAttribute("disablepictureinpicture", "");
-        wrap.appendChild(preview);
-        state.preview = preview;
+        state.wrap = wrap;
+        // No custom preview here — the platform's video_upload widget already
+        // renders one (a second one was a duplicate). We scrub THAT video when the
+        // trim handles move, if its source supports seeking.
 
         // ── Time-range slider (two overlaid native ranges) ──
         const slider = document.createElement("div");
@@ -126,10 +122,13 @@ function setup(node) {
             }
             startW.value = Math.round(lo * 100) / 100;
             endW.value = Math.round(hi * 100) / 100;
+            // Scrub the platform's preview video to the handle you're dragging, if
+            // its source is seekable (some serve without HTTP range support).
             try {
-                if (state.preview.readyState >= 1) {
-                    state.preview.pause();
-                    state.preview.currentTime = (document.activeElement === rMax) ? hi : lo;
+                const fv = frontendVideo(state);
+                if (fv && fv.seekable && fv.seekable.length && fv.seekable.end(0) > 0.1) {
+                    fv.pause();
+                    fv.currentTime = (document.activeElement === rMax) ? hi : lo;
                 }
             } catch (_) {}
             refresh(state);
@@ -165,9 +164,6 @@ async function loadMeta(state, value) {
     if (!value) return;
     try {
         state._loaded = value;
-        state.preview.src = viewURL(value);
-        state.preview.classList.add("has-src");
-
         const resp = await api.fetchApi(`/floyo_vs/probe?filename=${encodeURIComponent(value)}`);
         const m = await resp.json();
         if (!resp.ok || m.error) throw new Error(m.error || "probe failed");
