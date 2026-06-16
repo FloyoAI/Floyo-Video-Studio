@@ -27,6 +27,16 @@ except Exception as _e:  # pragma: no cover
     _HAS_AV = False
     _AV_ERR = str(_e)
 
+# decord (already in the Floyo image) reads EXACT frames by index very fast —
+# only the requested frames are decoded, so an exact-N extraction stays quick even
+# on a long video. Used for the target_frames path; PyAV is the fallback.
+try:
+    import decord
+    decord.bridge.set_bridge("native")
+    _HAS_DECORD = True
+except Exception:
+    _HAS_DECORD = False
+
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg", ".gif")
 QUALITY_PRESETS = {"Source": None, "1080p": 1080, "720p": 720, "480p": 480}
 
@@ -153,6 +163,35 @@ def _extract_audio(path, start, end):
         return _silent_audio()
 
 
+def _decord_exact_frames(path, start, end, n, tw, th, do_downscale):
+    """Read EXACTLY n frames, evenly spaced over [start, end] seconds, directly by
+    index using decord. Only the n frames are decoded (fast even on long videos)
+    and they are the real frames (no resampling). Downscales at decode when asked.
+    Returns a (n, H, W, 3) uint8 RGB array, or None to fall back to PyAV."""
+    try:
+        from decord import VideoReader, cpu
+        if do_downscale:
+            vr = VideoReader(path, ctx=cpu(0), width=int(tw), height=int(th), num_threads=0)
+        else:
+            vr = VideoReader(path, ctx=cpu(0), num_threads=0)
+        total = len(vr)
+        if total <= 0:
+            return None
+        fps = float(vr.get_avg_fps() or 25.0)
+        sf = max(0, int(round(start * fps)))
+        ef = int(round(end * fps)) if end and end > 0 else total
+        ef = min(max(ef, sf + 1), total)
+        idx = np.linspace(sf, ef - 1, n)
+        idx = np.clip(np.round(idx).astype(np.int64), 0, total - 1).tolist()
+        batch = vr.get_batch(idx)
+        arr = batch.asnumpy() if hasattr(batch, "asnumpy") else np.asarray(batch)
+        if arr is None or arr.ndim != 4 or arr.shape[0] != n:
+            return None
+        return np.ascontiguousarray(arr)
+    except Exception:
+        return None
+
+
 # ───────────────────────── node ─────────────────────────
 class FloyoVideoStudio:
     @classmethod
@@ -245,77 +284,89 @@ class FloyoVideoStudio:
                 out_fps = src_fps
             step = 1.0 / out_fps if out_fps else 0.0
 
+        # ── FAST PATH: exact-N via decord — decodes ONLY the n requested frames by
+        #    index, so an exact extraction stays quick even on a long video, and the
+        #    frames are the real ones (no resampling). Used when the count is sparse
+        #    vs the window; PyAV handles all-frames / dense / fallback. ──
+        do_downscale = bool(preset_h and src_h and src_h > preset_h)
+        decord_batch = None
+        if n_target > 0 and _HAS_DECORD:
+            window_frames = max(1, int(round(out_dur * src_fps)))
+            if n_target <= int(window_frames * 0.7) + 2:
+                decord_batch = _decord_exact_frames(path, start, end, n_target, tw, th, do_downscale)
+
         frames = []
-        try:
-            with av.open(path) as c:
-                v = c.streams.video[0]
-                v.thread_type = "AUTO"
-                if start > 0 and v.time_base:
-                    try:
-                        c.seek(int(start / v.time_base), stream=v)
-                    except Exception:
-                        pass
-                if n_target > 0:
-                    ti = 0
-                    last_nd = None
-                    for frame in c.decode(v):
-                        t = frame.time
-                        if t is None or t < start - 1e-4:
-                            continue
-                        if ti >= n_target:
-                            break
-                        nd = None
-                        # this frame covers every target time up to its timestamp
-                        while ti < n_target and targets[ti] <= t + 1e-4:
-                            if nd is None:
-                                nd = frame.reformat(width=tw, height=th, format="rgb24").to_ndarray()
-                            frames.append(nd)
-                            last_nd = nd
+        if decord_batch is None:
+            try:
+                with av.open(path) as c:
+                    v = c.streams.video[0]
+                    v.thread_type = "AUTO"
+                    if start > 0 and v.time_base:
+                        try:
+                            c.seek(int(start / v.time_base), stream=v)
+                        except Exception:
+                            pass
+                    if n_target > 0:
+                        ti = 0
+                        last_nd = None
+                        for frame in c.decode(v):
+                            t = frame.time
+                            if t is None or t < start - 1e-4:
+                                continue
+                            if ti >= n_target:
+                                break
+                            nd = None
+                            while ti < n_target and targets[ti] <= t + 1e-4:
+                                if nd is None:
+                                    nd = frame.reformat(width=tw, height=th, format="rgb24").to_ndarray()
+                                frames.append(nd)
+                                last_nd = nd
+                                ti += 1
+                            if t >= end:
+                                break
+                        while ti < n_target and last_nd is not None:
+                            frames.append(last_nd)
                             ti += 1
-                        if t >= end:
-                            break
-                    # video ended before all targets — pad with the last frame so the
-                    # output is EXACTLY n_target frames (what the model asked for).
-                    while ti < n_target and last_nd is not None:
-                        frames.append(last_nd)
-                        ti += 1
-                else:
-                    next_capture = start
-                    for frame in c.decode(v):
-                        t = frame.time
-                        if t is None:
-                            continue
-                        if t < start - 1e-4:
-                            continue
-                        if t >= end:
-                            break
-                        if step and (t + 1e-4) < next_capture:
-                            continue
-                        nd = frame.reformat(width=tw, height=th, format="rgb24").to_ndarray()
-                        frames.append(nd)
-                        next_capture += step if step else 0.0
-                        if next_capture < t:
-                            next_capture = t + step
-                        if frame_cap and len(frames) >= frame_cap:
-                            break
-        except Exception as e:
-            raise RuntimeError(f"Could not decode the selected range: {e}")
+                    else:
+                        next_capture = start
+                        for frame in c.decode(v):
+                            t = frame.time
+                            if t is None:
+                                continue
+                            if t < start - 1e-4:
+                                continue
+                            if t >= end:
+                                break
+                            if step and (t + 1e-4) < next_capture:
+                                continue
+                            nd = frame.reformat(width=tw, height=th, format="rgb24").to_ndarray()
+                            frames.append(nd)
+                            next_capture += step if step else 0.0
+                            if next_capture < t:
+                                next_capture = t + step
+                            if frame_cap and len(frames) >= frame_cap:
+                                break
+            except Exception as e:
+                raise RuntimeError(f"Could not decode the selected range: {e}")
+            if not frames:
+                raise RuntimeError("No frames found in the selected time range — widen start/end.")
 
-        if not frames:
-            raise RuntimeError("No frames found in the selected time range — widen start/end.")
-
-        # Build the (N,H,W,3) float tensor with a single pre-allocated buffer and
-        # one in-place scale — avoids np.stack's extra uint8 copy + a second
-        # float32 copy (a big win when the OUTPUT frames are large). Free each
-        # source frame as we go to keep peak memory low on low-end machines.
-        n = len(frames)
-        fh, fw = frames[0].shape[:2]
-        arr = np.empty((n, fh, fw, 3), dtype=np.float32)
-        for i in range(n):
-            arr[i] = frames[i]
-            frames[i] = None
-        arr /= 255.0
-        images = torch.from_numpy(arr)
+        # Build the (N,H,W,3) float tensor. decord gives one contiguous uint8 array;
+        # the PyAV path fills a pre-allocated buffer with one in-place scale (frames
+        # freed as we go → low peak memory on weak machines).
+        if decord_batch is not None:
+            arr = decord_batch.astype(np.float32)
+            arr /= 255.0
+            images = torch.from_numpy(arr)
+        else:
+            n = len(frames)
+            fh, fw = frames[0].shape[:2]
+            arr = np.empty((n, fh, fw, 3), dtype=np.float32)
+            for i in range(n):
+                arr[i] = frames[i]
+                frames[i] = None
+            arr /= 255.0
+            images = torch.from_numpy(arr)
 
         audio = _extract_audio(path, start, end) if include_audio else _silent_audio()
 
