@@ -1,0 +1,24 @@
+[project]
+name = "floyo-video-studio"
+version = "0.1.0"
+description = "One node to load a video and get everything: frames, audio, fps, duration and size. Trim by start/end time (with live timestamp AND frame count), 1-click downscale to 1080p/720p/480p, memory-light streaming, and upload-only with no file paths exposed — built for hosted ComfyUI."
+authors = [
+    { name = "Floyo" }
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dependencies = [
+    "av>=11.0.0",
+    "numpy",
+]
+
+[project.urls]
+"Homepage" = "https://floyo.ai"
+"Repository" = "https://github.com/FloyoAI/Floyo-Video-Studio"
+"BugTracker" = "https://github.com/FloyoAI/Floyo-Video-Studio/issues"
+
+[tool.comfy]
+PublisherId = "floyo"
+DisplayName = "Floyo Video Studio"
+Icon = ""
