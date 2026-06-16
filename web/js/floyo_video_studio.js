@@ -64,13 +64,14 @@ function setup(node) {
         const videoW = getWidget(node, "video");
         const startW = getWidget(node, "start_seconds");
         const endW = getWidget(node, "end_seconds");
+        const targetFpsW = getWidget(node, "target_fps");
         if (!videoW || !startW || !endW) return;
 
         // Hide the raw string field so no one can type a server path.
         videoW.type = "hidden";
         videoW.computeSize = () => [0, -4];
 
-        const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW };
+        const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW };
         node.__fvs = state;
 
         // ── Upload button (DOM, so we control the look + accept video/*) ──
@@ -151,6 +152,12 @@ function setup(node) {
             w.callback = function () { const r = orig?.apply(this, arguments); syncFromWidgets(state); return r; };
         };
         wrapCb(startW); wrapCb(endW);
+        // target_fps doesn't move the handles, but it changes the output frame
+        // count — refresh the readout live when it changes.
+        if (targetFpsW) {
+            const orig = targetFpsW.callback;
+            targetFpsW.callback = function () { const r = orig?.apply(this, arguments); refresh(state); return r; };
+        }
 
         node.addDOMWidget("fvs_ui", "floyo_video_studio", wrap, { serialize: false });
 
@@ -232,13 +239,19 @@ function refresh(state) {
         state.fill.style.left = a + "%";
         state.fill.style.width = (b - a) + "%";
 
+        // Per-handle frame index = position in the SOURCE video (source fps).
         const fLo = fps ? Math.round(lo * fps) : 0;
         const fHi = fps ? Math.round(hi * fps) : 0;
-        const nFrames = Math.max(0, fHi - fLo);
+        // Total OUTPUT frames respects target_fps (0 = source) — so the count
+        // updates the moment you change trim OR target_fps.
+        const tfps = state.targetFpsW ? (Number(state.targetFpsW.value) || 0) : 0;
+        const efps = tfps > 0 ? tfps : fps;
+        const nFrames = efps ? Math.max(0, Math.round((hi - lo) * efps)) : Math.max(0, fHi - fLo);
         state.readout.innerHTML =
             `Start <b>${fmtTime(lo)}</b> <span class="fvs-frames">(frame ${fLo})</span> → ` +
             `End <b>${fmtTime(hi)}</b> <span class="fvs-frames">(frame ${fHi})</span><br>` +
-            `<b>${(hi - lo).toFixed(1)}s</b> · <span class="fvs-frames">${nFrames} frames</span>${fps ? ` @ ${fps} fps` : ""}`;
+            `<b>${(hi - lo).toFixed(1)}s</b> · <span class="fvs-frames">${nFrames} frames</span>${efps ? ` @ ${efps} fps` : ""}` +
+            `${tfps > 0 ? ` <span style="opacity:.6">(target)</span>` : ""}`;
     } catch (_) {}
 }
 
