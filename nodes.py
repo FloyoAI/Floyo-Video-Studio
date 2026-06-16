@@ -45,27 +45,34 @@ def _list_input_videos():
 
 
 def _safe_input_path(video_name):
-    """Resolve an upload-widget filename to a real file INSIDE the input dir only.
-
-    Rejects path traversal / absolute paths (the CVE-2024-21575 class of bug) and
-    never lets a caller reach outside ComfyUI's managed input directory. Raises a
-    generic message that never contains the resolved server path.
-    """
+    """Resolve the video-upload widget value to a real file the SAME way the core
+    Load Video / Load Image nodes do (folder_paths.get_annotated_filepath), so a
+    file the platform stored in the input folder is reliably found on the
+    execution backend. Confined to the managed input/temp dirs (defense-in-depth
+    against the CVE-2024-21575 traversal class); no path is ever returned to the
+    client."""
     if not video_name or not str(video_name).strip():
         raise ValueError("No video selected — upload one first.")
     name = str(video_name).strip()
-    # Strip any ComfyUI "[input]"/"subfolder" annotation but keep just a relative name.
-    if name.startswith(("/", "\\")) or (len(name) > 1 and name[1] == ":"):
-        raise ValueError("Invalid video reference.")
-    if ".." in name.replace("\\", "/").split("/"):
-        raise ValueError("Invalid video reference.")
-    input_dir = os.path.realpath(folder_paths.get_input_directory())
-    candidate = os.path.realpath(os.path.join(input_dir, name))
-    if candidate != input_dir and not candidate.startswith(input_dir + os.sep):
-        raise ValueError("Invalid video reference.")
-    if not os.path.isfile(candidate):
+    try:
+        path = folder_paths.get_annotated_filepath(name)
+    except Exception:
+        path = os.path.join(folder_paths.get_input_directory(), name)
+    if not path or not os.path.isfile(path):
         raise ValueError("Video file not found — upload it again.")
-    return candidate
+    real = os.path.realpath(path)
+    ok = False
+    for getter in ("get_input_directory", "get_temp_directory"):
+        try:
+            base = os.path.realpath(getattr(folder_paths, getter)())
+            if real == base or real.startswith(base + os.sep):
+                ok = True
+                break
+        except Exception:
+            pass
+    if not ok:
+        raise ValueError("Invalid video reference.")
+    return real
 
 
 def _even(n):
@@ -152,10 +159,12 @@ class FloyoVideoStudio:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # A plain string the JS turns into an upload button + preview. The
-                # value is just a filename; the server guards it to the input dir.
-                "video": ("STRING", {"default": "", "video_upload": True,
-                                     "tooltip": "Upload a video. Only the filename is used — no server paths."}),
+                # A video-upload combo — EXACTLY like the core Load Video node, so
+                # the platform's standard uploader stores the file in the input
+                # folder and the execution backend can find it. The frontend
+                # renders the upload control from the `video_upload` flag.
+                "video": (sorted(_list_input_videos()), {"video_upload": True,
+                          "tooltip": "Upload a video — stored in the input folder like Load Video. No server paths."}),
                 "start_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.1,
                                             "tooltip": "Trim start (seconds)."}),
                 "end_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.1,
@@ -297,39 +306,6 @@ try:
             return web.json_response(_probe(path))
         except Exception as e:
             return web.json_response({"error": str(e)}, status=400)
-
-    @PromptServer.instance.routes.post("/floyo_vs/upload")
-    async def _floyo_vs_upload(request):
-        """Save an uploaded video into ComfyUI's input dir and return ONLY its
-        filename (never a path). Sanitises the name and avoids overwrites."""
-        try:
-            reader = await request.multipart()
-            field = await reader.next()
-            if field is None or field.name != "video":
-                return web.json_response({"error": "No video file in request."}, status=400)
-            raw = os.path.basename(field.filename or "upload.mp4")
-            clean = "".join(ch for ch in raw if ch.isalnum() or ch in "._- ").strip() or "upload.mp4"
-            if not clean.lower().endswith(VIDEO_EXTENSIONS):
-                clean += ".mp4"
-            input_dir = folder_paths.get_input_directory()
-            os.makedirs(input_dir, exist_ok=True)
-            base, ext = os.path.splitext(clean)
-            name = clean
-            dest = os.path.join(input_dir, name)
-            i = 1
-            while os.path.exists(dest):
-                name = f"{base}_{i}{ext}"
-                dest = os.path.join(input_dir, name)
-                i += 1
-            with open(dest, "wb") as f:
-                while True:
-                    chunk = await field.read_chunk()
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            return web.json_response({"name": name})
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
 except Exception:
     # Not running inside a ComfyUI server context (e.g. import-time tooling) — skip.
     pass

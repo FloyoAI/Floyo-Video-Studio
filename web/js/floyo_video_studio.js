@@ -1,17 +1,16 @@
 /* Floyo Video Studio — frontend UX for the FloyoVideoStudio node.
  * --------------------------------------------------------------------------
- *  • Upload-only video widget (the raw string field is hidden so a user can
- *    never type a server path — security for a hosted platform).
- *  • In-node <video> preview.
- *  • A dual-handle TIME range slider that shows BOTH the timestamp AND the
- *    frame number live as you drag (per senior-dev feedback: frame count
- *    matters for video models that need specific multiples), driving the
- *    start_seconds / end_seconds number widgets.
+ * Upload is handled by the platform's built-in `video_upload` widget (exactly
+ * like the core Load Video node), so the file is stored in the input folder and
+ * the GPU execution backend can find it. This file only ADDS the extras:
+ *   • a dual-handle TIME range slider that shows BOTH the timestamp AND the
+ *     frame number live (frame count matters for video models), driving the
+ *     start_seconds / end_seconds widgets;
+ *   • a playable in-node preview that scrubs to the start / end frame as you drag.
  *
- *  All network calls go through ComfyUI's `api` helper so they resolve through
- *  Floyo's hosted comfyui-proxy base path (a bare "/floyo_vs/..." would 404 on
- *  the hosted frontend). No global observers/timers — per-node setup only,
- *  everything wrapped in try/catch so it can never break the canvas.
+ * Network calls go through ComfyUI's `api` helper so they resolve through the
+ * hosted proxy. No global observers/timers — per-node setup only, all wrapped in
+ * try/catch so it can never break the canvas.
  */
 
 import { app } from "../../../scripts/app.js";
@@ -24,9 +23,6 @@ function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
         const css = `
 .fvs-wrap { display:flex; flex-direction:column; gap:8px; padding:6px 8px; box-sizing:border-box; width:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-.fvs-upload { display:flex; align-items:center; justify-content:center; gap:6px; height:30px; border:1px dashed rgba(255,255,255,0.35); border-radius:8px; color:#e5e7eb; background:rgba(255,255,255,0.04); cursor:pointer; font-size:12px; user-select:none; transition:background 120ms ease,border-color 120ms ease; }
-.fvs-upload:hover { background:rgba(255,255,255,0.09); border-color:rgba(255,255,255,0.6); }
-.fvs-upload.is-busy { opacity:0.6; pointer-events:none; }
 .fvs-preview { width:100%; border-radius:8px; background:#000; display:none; aspect-ratio:16/9; object-fit:contain; }
 .fvs-preview.has-src { display:block; }
 .fvs-meta { font-size:11px; color:#9ca3af; min-height:14px; }
@@ -59,6 +55,17 @@ function getWidget(node, name) {
     return (node.widgets || []).find((w) => w.name === name);
 }
 
+// Parse a ComfyUI annotated filename ("subfolder/name [input]") into a /view URL.
+function viewURL(value) {
+    let v = String(value || ""), type = "input", sub = "";
+    const m = v.match(/^(.*) \[(\w+)\]$/);
+    if (m) { v = m[1]; type = m[2]; }
+    const parts = v.split("/");
+    const fn = parts.pop();
+    sub = parts.join("/");
+    return api.apiURL(`/view?filename=${encodeURIComponent(fn)}&type=${type}&subfolder=${encodeURIComponent(sub)}&t=${Date.now()}`);
+}
+
 function setup(node) {
     try {
         const videoW = getWidget(node, "video");
@@ -67,38 +74,17 @@ function setup(node) {
         const targetFpsW = getWidget(node, "target_fps");
         if (!videoW || !startW || !endW) return;
 
-        // Hide the raw string field so no one can type a server path.
-        videoW.type = "hidden";
-        videoW.computeSize = () => [0, -4];
-
         const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW };
         node.__fvs = state;
 
-        // ── Upload button (DOM, so we control the look + accept video/*) ──
         const wrap = document.createElement("div");
         wrap.className = "fvs-wrap";
 
-        const upload = document.createElement("div");
-        upload.className = "fvs-upload";
-        upload.textContent = "📁  Upload video";
-        const fileInput = document.createElement("input");
-        fileInput.type = "file";
-        fileInput.accept = "video/*";
-        fileInput.style.display = "none";
-        upload.appendChild(fileInput);
-        upload.addEventListener("click", () => fileInput.click());
-        fileInput.addEventListener("change", () => {
-            const f = fileInput.files && fileInput.files[0];
-            if (f) doUpload(state, f, upload);
-            fileInput.value = "";
-        });
-        wrap.appendChild(upload);
-
-        // ── Preview ──
+        // ── Preview (playable, scrubs to start/end on drag) ──
         const preview = document.createElement("video");
         preview.className = "fvs-preview";
         preview.muted = true;
-        preview.controls = true;        // user can play / scrub the source
+        preview.controls = true;
         preview.playsInline = true;
         preview.preload = "auto";
         preview.setAttribute("disablepictureinpicture", "");
@@ -125,7 +111,7 @@ function setup(node) {
 
         const meta = document.createElement("div");
         meta.className = "fvs-meta";
-        meta.textContent = "No video loaded.";
+        meta.textContent = "Upload a video to set the trim range.";
         wrap.appendChild(meta);
         state.metaLabel = meta;
 
@@ -135,14 +121,11 @@ function setup(node) {
             let hi = parseFloat(rMax.value) * dur;
             const minGap = (1 / (state.meta.fps || 30)) * 2;
             if (lo > hi - minGap) {
-                // push whichever the user is NOT holding
                 if (document.activeElement === rMin) { lo = Math.max(0, hi - minGap); rMin.value = lo / dur; }
                 else { hi = Math.min(dur, lo + minGap); rMax.value = hi / dur; }
             }
             startW.value = Math.round(lo * 100) / 100;
             endW.value = Math.round(hi * 100) / 100;
-            // Scrub the preview to the handle you're dragging so you SEE the
-            // exact start / end frame you're picking.
             try {
                 if (state.preview.readyState >= 1) {
                     state.preview.pause();
@@ -155,77 +138,49 @@ function setup(node) {
         rMin.addEventListener("input", onSlide);
         rMax.addEventListener("input", onSlide);
 
-        // Keep the slider in sync if the user types into the number widgets.
-        const wrapCb = (w) => {
+        const wrapCb = (w, fn) => {
             const orig = w.callback;
-            w.callback = function () { const r = orig?.apply(this, arguments); syncFromWidgets(state); return r; };
+            w.callback = function () { const r = orig?.apply(this, arguments); try { fn(); } catch (_) {} return r; };
         };
-        wrapCb(startW); wrapCb(endW);
-        // target_fps doesn't move the handles, but it changes the output frame
-        // count — refresh the readout live when it changes.
-        if (targetFpsW) {
-            const orig = targetFpsW.callback;
-            targetFpsW.callback = function () { const r = orig?.apply(this, arguments); refresh(state); return r; };
-        }
+        wrapCb(startW, () => syncFromWidgets(state));
+        wrapCb(endW, () => syncFromWidgets(state));
+        if (targetFpsW) wrapCb(targetFpsW, () => refresh(state));
+        // When the platform's upload/combo sets a new video, (re)load its metadata.
+        wrapCb(videoW, () => loadMeta(state, videoW.value));
 
         node.addDOMWidget("fvs_ui", "floyo_video_studio", wrap, { serialize: false });
 
-        // Restore a saved video (workflow reload) once widget values are populated.
-        setTimeout(() => {
-            const name = videoW.value;
-            if (name) loadMeta(state, name);
-        }, 80);
+        // Pick up a value that's already set (workflow reload / post-upload).
+        [120, 600, 1500].forEach((d) => setTimeout(() => {
+            if (videoW.value && videoW.value !== state._loaded) loadMeta(state, videoW.value);
+        }, d));
 
-        // A roomier default so the preview + slider fit.
         if (!node.size || node.size[0] < 300) node.setSize?.([320, node.size ? node.size[1] : 360]);
     } catch (e) {
         console.error("[Floyo Video Studio] setup failed:", e);
     }
 }
 
-async function doUpload(state, file, uploadEl) {
+async function loadMeta(state, value) {
+    if (!value) return;
     try {
-        uploadEl.classList.add("is-busy");
-        uploadEl.textContent = "⏳  Uploading…";
-        const fd = new FormData();
-        fd.append("video", file, file.name);
-        const resp = await api.fetchApi("/floyo_vs/upload", { method: "POST", body: fd });
-        const data = await resp.json();
-        if (!resp.ok || !data.name) throw new Error(data.error || "upload failed");
-        state.videoW.value = data.name;
-        await loadMeta(state, data.name);
-        uploadEl.textContent = "📁  Change video";
-    } catch (e) {
-        uploadEl.textContent = "⚠️  Upload failed — retry";
-        console.error("[Floyo Video Studio] upload:", e);
-    } finally {
-        uploadEl.classList.remove("is-busy");
-    }
-}
-
-async function loadMeta(state, filename) {
-    try {
-        // Preview through the api base path (hosted-proxy safe).
-        state.preview.src = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=input&t=${Date.now()}`);
+        state._loaded = value;
+        state.preview.src = viewURL(value);
         state.preview.classList.add("has-src");
-        state.preview.play?.().catch(() => {});
 
-        const resp = await api.fetchApi(`/floyo_vs/probe?filename=${encodeURIComponent(filename)}`);
+        const resp = await api.fetchApi(`/floyo_vs/probe?filename=${encodeURIComponent(value)}`);
         const m = await resp.json();
         if (!resp.ok || m.error) throw new Error(m.error || "probe failed");
         state.meta = m;
         state.metaLabel.textContent = `${m.width}×${m.height} · ${m.fps} fps · ${fmtTime(m.duration)} · ${m.frame_count} frames${m.has_audio ? " · 🔊" : ""}`;
-
-        // Default trim = whole clip if widgets are still at defaults.
         if ((Number(state.endW.value) || 0) <= 0) state.endW.value = Math.round(m.duration * 100) / 100;
         syncFromWidgets(state);
     } catch (e) {
-        state.metaLabel.textContent = "Could not read video info.";
+        state.metaLabel.textContent = "Could not read video info (the trim still works by seconds).";
         console.error("[Floyo Video Studio] probe:", e);
     }
 }
 
-// number widgets -> slider handles + readout
 function syncFromWidgets(state) {
     const dur = state.meta.duration || 1;
     const lo = Math.min(Math.max(0, Number(state.startW.value) || 0), dur);
@@ -236,7 +191,6 @@ function syncFromWidgets(state) {
     refresh(state);
 }
 
-// redraw the fill + the timestamp/frame readout
 function refresh(state) {
     try {
         const dur = state.meta.duration || 1;
@@ -248,11 +202,8 @@ function refresh(state) {
         state.fill.style.left = a + "%";
         state.fill.style.width = (b - a) + "%";
 
-        // Per-handle frame index = position in the SOURCE video (source fps).
         const fLo = fps ? Math.round(lo * fps) : 0;
         const fHi = fps ? Math.round(hi * fps) : 0;
-        // Total OUTPUT frames respects target_fps (0 = source) — so the count
-        // updates the moment you change trim OR target_fps.
         const tfps = state.targetFpsW ? (Number(state.targetFpsW.value) || 0) : 0;
         const efps = tfps > 0 ? tfps : fps;
         const nFrames = efps ? Math.max(0, Math.round((hi - lo) * efps)) : Math.max(0, fHi - fLo);
