@@ -258,7 +258,17 @@ class FloyoVideoStudio:
         if not frames:
             raise RuntimeError("No frames found in the selected time range — widen start/end.")
 
-        arr = np.stack(frames).astype(np.float32) / 255.0  # (N, H, W, 3)
+        # Build the (N,H,W,3) float tensor with a single pre-allocated buffer and
+        # one in-place scale — avoids np.stack's extra uint8 copy + a second
+        # float32 copy (a big win when the OUTPUT frames are large). Free each
+        # source frame as we go to keep peak memory low on low-end machines.
+        n = len(frames)
+        fh, fw = frames[0].shape[:2]
+        arr = np.empty((n, fh, fw, 3), dtype=np.float32)
+        for i in range(n):
+            arr[i] = frames[i]
+            frames[i] = None
+        arr /= 255.0
         images = torch.from_numpy(arr)
 
         audio = _extract_audio(path, start, end) if include_audio else _silent_audio()

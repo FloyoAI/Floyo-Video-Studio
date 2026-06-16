@@ -98,8 +98,9 @@ function setup(node) {
         const preview = document.createElement("video");
         preview.className = "fvs-preview";
         preview.muted = true;
-        preview.loop = true;
+        preview.controls = true;        // user can play / scrub the source
         preview.playsInline = true;
+        preview.preload = "auto";
         preview.setAttribute("disablepictureinpicture", "");
         wrap.appendChild(preview);
         state.preview = preview;
@@ -140,6 +141,14 @@ function setup(node) {
             }
             startW.value = Math.round(lo * 100) / 100;
             endW.value = Math.round(hi * 100) / 100;
+            // Scrub the preview to the handle you're dragging so you SEE the
+            // exact start / end frame you're picking.
+            try {
+                if (state.preview.readyState >= 1) {
+                    state.preview.pause();
+                    state.preview.currentTime = (document.activeElement === rMax) ? hi : lo;
+                }
+            } catch (_) {}
             refresh(state);
             node.setDirtyCanvas?.(true, true);
         };
