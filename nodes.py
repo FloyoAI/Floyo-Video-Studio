@@ -171,9 +171,11 @@ class FloyoVideoStudio:
                                           "tooltip": "Trim end (seconds). 0 = until the end."}),
                 "quality": (list(QUALITY_PRESETS.keys()), {"tooltip": "Downscale preset. Never upscales."}),
                 "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 1.0,
-                                         "tooltip": "Output fps. 0 = keep source fps. Lower = fewer frames = less memory."}),
+                                         "tooltip": "Output frames-per-second. 0 = keep source fps. Lower fps = fewer frames."}),
+                "target_frames": ("INT", {"default": 0, "min": 0, "max": 100000,
+                                          "tooltip": "Output EXACTLY this many frames, evenly sampled across the trim — for video models that need a specific count (e.g. 81). Overrides fps. 0 = off."}),
                 "frame_cap": ("INT", {"default": 0, "min": 0, "max": 100000,
-                                      "tooltip": "Max frames to extract (memory safety). 0 = no cap."}),
+                                      "tooltip": "Safety max frames (only when target_frames = 0). 0 = no cap."}),
                 "include_audio": ("BOOLEAN", {"default": True, "tooltip": "Also output the trimmed audio."}),
             }
         }
@@ -193,14 +195,14 @@ class FloyoVideoStudio:
     CATEGORY = "Floyo/Video"
 
     @classmethod
-    def IS_CHANGED(cls, video, start_seconds, end_seconds, quality, target_fps, frame_cap, include_audio):
+    def IS_CHANGED(cls, video, start_seconds, end_seconds, quality, target_fps, target_frames, frame_cap, include_audio):
         try:
             path = _safe_input_path(video)
-            return f"{path}:{os.path.getmtime(path)}:{start_seconds}:{end_seconds}:{quality}:{target_fps}:{frame_cap}:{include_audio}"
+            return f"{path}:{os.path.getmtime(path)}:{start_seconds}:{end_seconds}:{quality}:{target_fps}:{target_frames}:{frame_cap}:{include_audio}"
         except Exception:
             return float("nan")
 
-    def process(self, video, start_seconds, end_seconds, quality, target_fps, frame_cap, include_audio):
+    def process(self, video, start_seconds, end_seconds, quality, target_fps, target_frames, frame_cap, include_audio):
         if not _HAS_AV:
             raise RuntimeError(
                 "Floyo Video Studio needs PyAV. Install it on the server: pip install av  "
@@ -228,10 +230,20 @@ class FloyoVideoStudio:
         else:
             tw, th = _even(src_w or 16), _even(src_h or 16)
 
-        out_fps = float(target_fps) if target_fps and target_fps > 0 else src_fps
-        if out_fps <= 0:
-            out_fps = src_fps
-        step = 1.0 / out_fps if out_fps else 0.0
+        out_dur = max(1e-6, end - start)
+        n_target = int(target_frames) if target_frames else 0
+
+        if n_target > 0:
+            # EXACT N frames, evenly sampled across [start, end] — for video models
+            # that need a specific frame count (e.g. 81). fps is derived so the clip
+            # keeps its real timespan. Sample the centre of each of N equal segments.
+            targets = [start + (i + 0.5) * out_dur / n_target for i in range(n_target)]
+            out_fps = round(n_target / out_dur, 4)
+        else:
+            out_fps = float(target_fps) if target_fps and target_fps > 0 else src_fps
+            if out_fps <= 0:
+                out_fps = src_fps
+            step = 1.0 / out_fps if out_fps else 0.0
 
         frames = []
         try:
@@ -243,24 +255,49 @@ class FloyoVideoStudio:
                         c.seek(int(start / v.time_base), stream=v)
                     except Exception:
                         pass
-                next_capture = start
-                for frame in c.decode(v):
-                    t = frame.time
-                    if t is None:
-                        continue
-                    if t < start - 1e-4:
-                        continue
-                    if t >= end:
-                        break
-                    if step and (t + 1e-4) < next_capture:
-                        continue
-                    nd = frame.reformat(width=tw, height=th, format="rgb24").to_ndarray()
-                    frames.append(nd)
-                    next_capture += step if step else 0.0
-                    if next_capture < t:
-                        next_capture = t + step
-                    if frame_cap and len(frames) >= frame_cap:
-                        break
+                if n_target > 0:
+                    ti = 0
+                    last_nd = None
+                    for frame in c.decode(v):
+                        t = frame.time
+                        if t is None or t < start - 1e-4:
+                            continue
+                        if ti >= n_target:
+                            break
+                        nd = None
+                        # this frame covers every target time up to its timestamp
+                        while ti < n_target and targets[ti] <= t + 1e-4:
+                            if nd is None:
+                                nd = frame.reformat(width=tw, height=th, format="rgb24").to_ndarray()
+                            frames.append(nd)
+                            last_nd = nd
+                            ti += 1
+                        if t >= end:
+                            break
+                    # video ended before all targets — pad with the last frame so the
+                    # output is EXACTLY n_target frames (what the model asked for).
+                    while ti < n_target and last_nd is not None:
+                        frames.append(last_nd)
+                        ti += 1
+                else:
+                    next_capture = start
+                    for frame in c.decode(v):
+                        t = frame.time
+                        if t is None:
+                            continue
+                        if t < start - 1e-4:
+                            continue
+                        if t >= end:
+                            break
+                        if step and (t + 1e-4) < next_capture:
+                            continue
+                        nd = frame.reformat(width=tw, height=th, format="rgb24").to_ndarray()
+                        frames.append(nd)
+                        next_capture += step if step else 0.0
+                        if next_capture < t:
+                            next_capture = t + step
+                        if frame_cap and len(frames) >= frame_cap:
+                            break
         except Exception as e:
             raise RuntimeError(f"Could not decode the selected range: {e}")
 
@@ -283,9 +320,12 @@ class FloyoVideoStudio:
         audio = _extract_audio(path, start, end) if include_audio else _silent_audio()
 
         frame_count = int(images.shape[0])
-        out_duration = round(frame_count / out_fps, 3) if out_fps else round(end - start, 3)
+        if n_target > 0:
+            out_duration = round(out_dur, 3)          # the trim window is the real timespan
+        else:
+            out_duration = round(frame_count / out_fps, 3) if out_fps else round(end - start, 3)
         info = (f"{_fmt_time(start)}–{_fmt_time(end)}  ·  {frame_count} frames  ·  "
-                f"{tw}×{th}  ·  {out_fps:.0f} fps  ·  {out_duration:.1f}s")
+                f"{tw}×{th}  ·  {out_fps:.1f} fps  ·  {out_duration:.1f}s")
 
         return (images, audio, float(out_fps), int(tw), int(th), float(out_duration), frame_count, info)
 

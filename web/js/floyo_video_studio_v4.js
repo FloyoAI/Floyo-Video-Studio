@@ -75,9 +75,10 @@ function setup(node) {
         const startW = getWidget(node, "start_seconds");
         const endW = getWidget(node, "end_seconds");
         const targetFpsW = getWidget(node, "target_fps");
+        const targetFramesW = getWidget(node, "target_frames");
         if (!videoW || !startW || !endW) return;
 
-        const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW };
+        const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW, targetFramesW };
         node.__fvs = state;
 
         const wrap = document.createElement("div");
@@ -144,6 +145,7 @@ function setup(node) {
         wrapCb(startW, () => syncFromWidgets(state));
         wrapCb(endW, () => syncFromWidgets(state));
         if (targetFpsW) wrapCb(targetFpsW, () => refresh(state));
+        if (targetFramesW) wrapCb(targetFramesW, () => refresh(state));
         // When the platform's upload/combo sets a new video, (re)load its metadata.
         wrapCb(videoW, () => loadMeta(state, videoW.value));
 
@@ -198,16 +200,26 @@ function refresh(state) {
         state.fill.style.left = a + "%";
         state.fill.style.width = (b - a) + "%";
 
-        const fLo = fps ? Math.round(lo * fps) : 0;
+        const fLo = fps ? Math.round(lo * fps) : 0;   // source frame index (where in the video)
         const fHi = fps ? Math.round(hi * fps) : 0;
+        const tframes = state.targetFramesW ? (Number(state.targetFramesW.value) || 0) : 0;
         const tfps = state.targetFpsW ? (Number(state.targetFpsW.value) || 0) : 0;
-        const efps = tfps > 0 ? tfps : fps;
-        const nFrames = efps ? Math.max(0, Math.round((hi - lo) * efps)) : Math.max(0, fHi - fLo);
+        const segDur = Math.max(1e-6, hi - lo);
+        let nFrames, efps, mode;
+        if (tframes > 0) {                            // exact-N mode (model needs a count)
+            nFrames = tframes;
+            efps = Math.round((tframes / segDur) * 10) / 10;
+            mode = " (exact count)";
+        } else {
+            efps = tfps > 0 ? tfps : fps;
+            nFrames = efps ? Math.max(0, Math.round(segDur * efps)) : Math.max(0, fHi - fLo);
+            mode = tfps > 0 ? " (target fps)" : "";
+        }
         state.readout.innerHTML =
             `Start <b>${fmtTime(lo)}</b> <span class="fvs-frames">(frame ${fLo})</span> → ` +
             `End <b>${fmtTime(hi)}</b> <span class="fvs-frames">(frame ${fHi})</span><br>` +
             `<b>${(hi - lo).toFixed(1)}s</b> · <span class="fvs-frames">${nFrames} frames</span>${efps ? ` @ ${efps} fps` : ""}` +
-            `${tfps > 0 ? ` <span style="opacity:.6">(target)</span>` : ""}`;
+            `<span style="opacity:.6">${mode}</span>`;
     } catch (_) {}
 }
 
