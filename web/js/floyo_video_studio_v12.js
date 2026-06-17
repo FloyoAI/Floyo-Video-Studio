@@ -81,16 +81,34 @@ function getWidget(node, name) {
 // sibling of our wrap. Find it (walk up to the common container, then down) so we can
 // read its metadata AND scrub it when the trim handles move. Fallback: if there's
 // exactly one <video> on the page it's ours.
+// The preview <video> shows native controls (play + a seconds SEEK BAR). LiteGraph's
+// canvas grabs pointer drags to move/pan, which swallows the seek-bar drag so it can't
+// scrub. Stop the event from bubbling to the canvas (but DON'T preventDefault, so the
+// video's own controls keep working) — same trick the Sticky Note uses on its logo.
+function protectVideo(v) {
+    try {
+        if (!v || v.__floyoSeekFix) return v;
+        v.__floyoSeekFix = true;
+        const stop = (e) => { e.stopPropagation(); };
+        ["pointerdown", "mousedown", "touchstart"].forEach((ev) =>
+            v.addEventListener(ev, stop, { passive: true }));
+    } catch (_) {}
+    return v;
+}
+function protectVideos(root) {
+    try { (root || document).querySelectorAll("video").forEach(protectVideo); } catch (_) {}
+}
+
 function frontendVideo(state) {
     try {
         let root = state.wrap;
         for (let i = 0; i < 14 && root; i++) {
             const v = root.querySelector && root.querySelector("video");
-            if (v) return v;
+            if (v) return protectVideo(v);
             root = root.parentElement;
         }
         const all = document.querySelectorAll("video");
-        if (all.length === 1) return all[0];
+        if (all.length === 1) return protectVideo(all[0]);
     } catch (_) {}
     return null;
 }
@@ -191,13 +209,13 @@ let _badgeBrandInstalled = false;
 function installBadgeBrand() {
     if (_badgeBrandInstalled) return;
     _badgeBrandInstalled = true;
-    try { brandBadges(); } catch (_) {}
+    try { brandBadges(); protectVideos(); } catch (_) {}
     try {
         let pending = false;
         const obs = new MutationObserver(() => {
             if (pending) return;
             pending = true;
-            requestAnimationFrame(() => { pending = false; try { brandBadges(); } catch (_) {} });
+            requestAnimationFrame(() => { pending = false; try { brandBadges(); protectVideos(); } catch (_) {} });
         });
         obs.observe(document.body, { childList: true, subtree: true });
     } catch (_) {}
