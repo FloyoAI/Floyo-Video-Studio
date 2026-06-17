@@ -39,6 +39,9 @@ except Exception:
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg", ".gif")
 QUALITY_PRESETS = {"Source": None, "1080p": 1080, "720p": 720, "480p": 480}
+# Internal guard for the "all frames" path so a very long clip can't OOM. Users
+# who genuinely need more should downscale or set an exact target_frames.
+_ALL_FRAMES_SAFETY_CAP = 12000
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -210,38 +213,33 @@ class FloyoVideoStudio:
                                           "tooltip": "Trim end (seconds). 0 = until the end."}),
                 "quality": (list(QUALITY_PRESETS.keys()), {"tooltip": "Downscale preset. Never upscales."}),
                 "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 1.0,
-                                         "tooltip": "Output frames-per-second. 0 = keep source fps. Lower fps = fewer frames."}),
+                                         "tooltip": "Output frames-per-second. 0 = keep the video's own fps. Lower = fewer frames."}),
                 "target_frames": ("INT", {"default": 0, "min": 0, "max": 100000,
-                                          "tooltip": "Output EXACTLY this many frames, evenly sampled across the trim — for video models that need a specific count (e.g. 81). Overrides fps. 0 = off."}),
-                "frame_cap": ("INT", {"default": 0, "min": 0, "max": 100000,
-                                      "tooltip": "Safety max frames (only when target_frames = 0). 0 = no cap."}),
+                                          "tooltip": "Output EXACTLY this many frames, evenly sampled across the trim — for models that need a specific count (e.g. 81). Overrides fps. 0 = all frames."}),
                 "include_audio": ("BOOLEAN", {"default": True, "tooltip": "Also output the trimmed audio."}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT", "INT", "FLOAT", "INT", "STRING")
-    RETURN_NAMES = ("frames", "audio", "fps", "width", "height", "duration", "frame_count", "info")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT")
+    RETURN_NAMES = ("frames", "audio", "fps", "frame_count")
     OUTPUT_TOOLTIPS = (
-        "Extracted frames (image batch).",
+        "Extracted frames (image batch) — wire to your image / AI / Video Combine nodes.",
         "Trimmed audio (silent if none / disabled).",
-        "Output frames-per-second.",
-        "Output width (px).", "Output height (px).",
-        "Output duration (seconds).",
-        "Output frame count — matters for video models needing specific multiples.",
-        "Human-readable summary of the trim/quality.",
+        "Output frames-per-second — wire to Video Combine's frame_rate so the rebuilt video plays at the right speed.",
+        "Output frame count.",
     )
     FUNCTION = "process"
     CATEGORY = "Floyo/Video"
 
     @classmethod
-    def IS_CHANGED(cls, video, start_seconds, end_seconds, quality, target_fps, target_frames, frame_cap, include_audio):
+    def IS_CHANGED(cls, video, start_seconds, end_seconds, quality, target_fps, target_frames, include_audio):
         try:
             path = _safe_input_path(video)
-            return f"{path}:{os.path.getmtime(path)}:{start_seconds}:{end_seconds}:{quality}:{target_fps}:{target_frames}:{frame_cap}:{include_audio}"
+            return f"{path}:{os.path.getmtime(path)}:{start_seconds}:{end_seconds}:{quality}:{target_fps}:{target_frames}:{include_audio}"
         except Exception:
             return float("nan")
 
-    def process(self, video, start_seconds, end_seconds, quality, target_fps, target_frames, frame_cap, include_audio):
+    def process(self, video, start_seconds, end_seconds, quality, target_fps, target_frames, include_audio):
         if not _HAS_AV:
             raise RuntimeError(
                 "Floyo Video Studio needs PyAV. Install it on the server: pip install av  "
@@ -344,8 +342,8 @@ class FloyoVideoStudio:
                             next_capture += step if step else 0.0
                             if next_capture < t:
                                 next_capture = t + step
-                            if frame_cap and len(frames) >= frame_cap:
-                                break
+                            if len(frames) >= _ALL_FRAMES_SAFETY_CAP:
+                                break  # internal guard so a huge clip can't OOM
             except Exception as e:
                 raise RuntimeError(f"Could not decode the selected range: {e}")
             if not frames:
@@ -369,16 +367,13 @@ class FloyoVideoStudio:
             images = torch.from_numpy(arr)
 
         audio = _extract_audio(path, start, end) if include_audio else _silent_audio()
-
         frame_count = int(images.shape[0])
-        if n_target > 0:
-            out_duration = round(out_dur, 3)          # the trim window is the real timespan
-        else:
-            out_duration = round(frame_count / out_fps, 3) if out_fps else round(end - start, 3)
-        info = (f"{_fmt_time(start)}–{_fmt_time(end)}  ·  {frame_count} frames  ·  "
-                f"{tw}×{th}  ·  {out_fps:.1f} fps  ·  {out_duration:.1f}s")
 
-        return (images, audio, float(out_fps), int(tw), int(th), float(out_duration), frame_count, info)
+        # Clean output set (matches Floyo's "Video URL to Frames" node): the frames,
+        # their audio, the fps (for Video Combine's frame_rate), and the count. The
+        # trim/quality the user picked are already baked into the frames — width /
+        # height / duration are redundant, so they're not separate outputs.
+        return (images, audio, float(out_fps), frame_count)
 
 
 # ───────────────────────── server route (metadata for the JS slider) ─────────────────────────

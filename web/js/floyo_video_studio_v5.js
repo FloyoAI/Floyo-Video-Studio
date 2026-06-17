@@ -26,6 +26,10 @@ function injectStyles() {
 .fvs-preview { width:100%; border-radius:8px; background:#000; display:none; aspect-ratio:16/9; object-fit:contain; }
 .fvs-preview.has-src { display:block; }
 .fvs-meta { font-size:11px; color:#9ca3af; min-height:14px; }
+.fvs-src { display:flex; gap:6px; }
+.fvs-field { display:flex; align-items:center; gap:6px; font-size:11px; flex:1 1 0; min-width:0; }
+.fvs-field .fvs-lbl { color:#9ca3af; white-space:nowrap; }
+.fvs-field .fvs-val { flex:1; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.12); border-radius:6px; padding:3px 8px; color:#e5e7eb; text-align:right; font-variant-numeric:tabular-nums; cursor:not-allowed; user-select:none; }
 .fvs-slider { position:relative; height:30px; }
 .fvs-track { position:absolute; left:0; right:0; top:13px; height:4px; border-radius:3px; background:rgba(255,255,255,0.15); }
 .fvs-fill  { position:absolute; top:13px; height:4px; border-radius:3px; background:#60A5FA; }
@@ -87,6 +91,22 @@ function setup(node) {
         // No custom preview here — the platform's video_upload widget already
         // renders one (a second one was a duplicate). We scrub THAT video when the
         // trim handles move, if its source supports seeking.
+
+        // ── Read-only "this is the loaded video" facts (the real source fps +
+        //    frame count). They look like fields but are locked — the user can't
+        //    edit them; they're just so you know what you're working with. ──
+        const mkField = (label) => {
+            const f = document.createElement("div"); f.className = "fvs-field";
+            const l = document.createElement("span"); l.className = "fvs-lbl"; l.textContent = label;
+            const v = document.createElement("span"); v.className = "fvs-val"; v.textContent = "—";
+            f.append(l, v); return { field: f, val: v };
+        };
+        const srcRow = document.createElement("div"); srcRow.className = "fvs-src";
+        const srcFps = mkField("Video FPS");
+        const srcFrames = mkField("Video frames");
+        srcRow.append(srcFps.field, srcFrames.field);
+        wrap.appendChild(srcRow);
+        state.srcFps = srcFps.val; state.srcFrames = srcFrames.val;
 
         // ── Time-range slider (two overlaid native ranges) ──
         const slider = document.createElement("div");
@@ -170,7 +190,10 @@ async function loadMeta(state, value) {
         const m = await resp.json();
         if (!resp.ok || m.error) throw new Error(m.error || "probe failed");
         state.meta = m;
-        state.metaLabel.textContent = `${m.width}×${m.height} · ${m.fps} fps · ${fmtTime(m.duration)} · ${m.frame_count} frames${m.has_audio ? " · 🔊" : ""}`;
+        // The locked source facts.
+        if (state.srcFps) state.srcFps.textContent = `${m.fps}`;
+        if (state.srcFrames) state.srcFrames.textContent = `${m.frame_count}`;
+        state.metaLabel.textContent = `${m.width}×${m.height} · ${fmtTime(m.duration)}${m.has_audio ? " · 🔊 audio" : " · no audio"}`;
         if ((Number(state.endW.value) || 0) <= 0) state.endW.value = Math.round(m.duration * 100) / 100;
         syncFromWidgets(state);
     } catch (e) {
