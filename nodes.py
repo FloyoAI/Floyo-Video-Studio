@@ -49,13 +49,14 @@ except Exception:
 # so the module still imports on a frontend backend that lacks comfy_api (the static
 # RETURN_TYPES below still advertises the port; only execution needs the real API).
 try:
-    from comfy_api.input_impl import VideoFromComponents
+    from comfy_api.input_impl import VideoFromComponents, VideoFromFile
     from comfy_api.util import VideoComponents
     _HAS_VIDEO_API = True
 except Exception:
     try:
         from comfy_api.latest import InputImpl as _ImplNS, Types as _TypesNS
         VideoFromComponents = _ImplNS.VideoFromComponents
+        VideoFromFile = _ImplNS.VideoFromFile
         VideoComponents = _TypesNS.VideoComponents
         _HAS_VIDEO_API = True
     except Exception:
@@ -405,11 +406,28 @@ class FloyoVideoStudio:
         if _HAS_VIDEO_API:
             try:
                 vid_audio = audio if (include_audio and meta.get("has_audio")) else None
-                video_out = VideoFromComponents(VideoComponents(
+                comps = VideoComponents(
                     images=images,
                     audio=vid_audio,
                     frame_rate=Fraction(out_fps).limit_denominator(1000000),
-                ))
+                )
+                vc = VideoFromComponents(comps)
+                # Encode to a real temp .mp4 and hand back a *file-backed* VIDEO. Why:
+                # Floyo's partner AI nodes upload the clip via video.get_stream_source()
+                # -> upload_file(path), which needs a filesystem PATH. A bare
+                # VideoFromComponents only yields an in-memory BytesIO, which their
+                # uploader rejects ("expected str/bytes/os.PathLike, not BytesIO"). A
+                # VideoFromFile exposes a real path, so it works with the partner nodes
+                # AND stays fully compatible with Save Video / Video Combine.
+                try:
+                    import uuid as _uuid
+                    tdir = folder_paths.get_temp_directory()
+                    os.makedirs(tdir, exist_ok=True)
+                    tpath = os.path.join(tdir, f"floyo_vs_{_uuid.uuid4().hex}.mp4")
+                    vc.save_to(tpath)
+                    video_out = VideoFromFile(tpath)
+                except Exception:
+                    video_out = vc  # fall back to in-memory (still fine for Save Video)
             except Exception:
                 video_out = None
 
