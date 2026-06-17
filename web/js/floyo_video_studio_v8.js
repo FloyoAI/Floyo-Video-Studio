@@ -87,25 +87,45 @@ function frontendVideo(state) {
     return null;
 }
 
-// Hide the canvas-drawn package badge ("Floyo-Video-Studio") on this node, and
-// — belt & suspenders for frontends that render it as DOM — hide that text pill
-// too. Scoped + time-boxed; no permanent global observer.
-function hidePackageBadge(node) {
-    try { node.drawBadges = function () {}; } catch (_) {}
-    let ticks = 0;
-    const sweep = () => {
-        try {
-            document.querySelectorAll("*").forEach((el) => {
-                if (el.children.length) return;
-                if ((el.textContent || "").trim() !== PKG_BADGE_TEXT) return;
-                const pill = el.closest("[class*='badge'],[class*='Badge'],[class*='pill'],[class*='Pill']") || el;
-                pill.style.display = "none";
-                pill.setAttribute("aria-hidden", "true");
-            });
-        } catch (_) {}
-    };
-    const t = setInterval(() => { sweep(); if (++ticks > 12) clearInterval(t); }, 500);
-    sweep();
+// Replace the node's package badge ("Floyo-Video-Studio" dark pill) with the Floyo
+// wordmark — the badge is a Vue/Tailwind element that re-renders (zoom / pan / select),
+// so we run a guarded sweep behind a debounced observer, installed once globally. The
+// dark pill background is cleared so only the logo shows.
+function brandBadges(root) {
+    (root || document).querySelectorAll("*").forEach((el) => {
+        if (el.__floyoBranded) return;
+        if (el.children.length) return;
+        if ((el.textContent || "").trim() !== PKG_BADGE_TEXT) return;
+        const pill = el.closest("[class*='rounded-full'],[class*='badge'],[class*='Badge'],[class*='pill'],[class*='Pill']") || el.parentElement || el;
+        pill.__floyoBranded = true;
+        pill.replaceChildren();
+        const img = document.createElement("img");
+        img.src = FLOYO_LOGO_DATA_URL;
+        img.alt = "Floyo";
+        img.draggable = false;
+        img.style.cssText = "height:15px;width:auto;display:block;opacity:0.92;pointer-events:none;";
+        pill.appendChild(img);
+        pill.style.background = "transparent";
+        pill.style.padding = "0";
+        pill.style.minWidth = "0";
+        pill.style.height = "auto";
+    });
+}
+
+let _badgeBrandInstalled = false;
+function installBadgeBrand() {
+    if (_badgeBrandInstalled) return;
+    _badgeBrandInstalled = true;
+    try { brandBadges(); } catch (_) {}
+    try {
+        let pending = false;
+        const obs = new MutationObserver(() => {
+            if (pending) return;
+            pending = true;
+            requestAnimationFrame(() => { pending = false; try { brandBadges(); } catch (_) {} });
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+    } catch (_) {}
 }
 
 function setup(node) {
@@ -292,41 +312,18 @@ function refresh(state) {
     } catch (_) {}
 }
 
-// Draw the Floyo wordmark in the node footer (where the hidden package badge was).
-function drawFooterLogo(node, ctx) {
-    try {
-        if (node.flags && node.flags.collapsed) return;
-        if (!_floyoLogo.complete || !_floyoLogo.naturalWidth) return;
-        const h = 13;
-        const w = h * (_floyoLogo.naturalWidth / _floyoLogo.naturalHeight);
-        const x = 10;
-        const y = node.size[1] - h - 6;
-        ctx.save();
-        ctx.globalAlpha = 0.8;
-        ctx.imageSmoothingEnabled = true;
-        ctx.drawImage(_floyoLogo, x, y, w, h);
-        ctx.restore();
-    } catch (_) {}
-}
-
 app.registerExtension({
     name: "Floyo.VideoStudio",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData?.name !== "FloyoVideoStudio") return;
         injectStyles();
+        installBadgeBrand();
 
         const onCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = onCreated?.apply(this, arguments);
             setup(this);
-            hidePackageBadge(this);
-            return r;
-        };
-
-        const onDraw = nodeType.prototype.onDrawForeground;
-        nodeType.prototype.onDrawForeground = function (ctx) {
-            const r = onDraw?.apply(this, arguments);
-            drawFooterLogo(this, ctx);
+            try { this.drawBadges = function () {}; } catch (_) {}
             return r;
         };
     },
