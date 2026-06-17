@@ -162,8 +162,8 @@ function attachPassiveFps(state, v) {
                     if (fps && !state.meta.fps) {
                         state.meta.fps = fps;
                         state.meta.frame_count = Math.round((state.meta.duration || 0) * fps);
-                        if (state.srcFps && state.srcFps.textContent === "—") state.srcFps.textContent = `${fps}`;
-                        if (state.srcFrames && state.srcFrames.textContent === "—") state.srcFrames.textContent = `${state.meta.frame_count}`;
+                        if (state.srcFps) { state.srcFps.textContent = `${fps}`; state.srcFps.title = ""; }
+                        if (state.srcFrames) { state.srcFrames.textContent = `${state.meta.frame_count}`; state.srcFrames.title = ""; }
                         refresh(state);
                     }
                 }
@@ -173,6 +173,39 @@ function attachPassiveFps(state, v) {
         };
         try { v.requestVideoFrameCallback(cb); } catch (_) {}
     } catch (_) {}
+}
+
+// Read the exact fps NOW by briefly playing the (already-buffered) preview muted and
+// timing ~9 frames via rVFC, then pausing + resetting. Used for SHORT clips only — the
+// data is already loaded so a fraction-of-a-second muted play is cheap; we never call
+// this for a long/large video (whose heavy decode could stutter the UI). Returns the fps
+// or 0.
+function measureFpsForced(state) {
+    return new Promise((resolve) => {
+        const v = frontendVideo(state);
+        if (!v || typeof v.requestVideoFrameCallback !== "function") { resolve(0); return; }
+        const times = [];
+        const prevMuted = v.muted, prevTime = v.currentTime || 0, prevPaused = v.paused;
+        let done = false;
+        const finish = () => {
+            if (done) return; done = true;
+            try { if (prevPaused) v.pause(); v.muted = prevMuted; v.currentTime = prevTime; } catch (_) {}
+            if (times.length < 3) { resolve(0); return; }
+            const d = [];
+            for (let i = 1; i < times.length; i++) { const dt = times[i] - times[i - 1]; if (dt > 0.0005) d.push(dt); }
+            if (!d.length) { resolve(0); return; }
+            d.sort((a, b) => a - b);
+            const med = d[Math.floor(d.length / 2)];
+            resolve(med > 0 ? Math.round((1 / med) * 100) / 100 : 0);
+        };
+        const cb = (now, meta) => {
+            times.push(meta && typeof meta.mediaTime === "number" ? meta.mediaTime : v.currentTime);
+            if (times.length >= 9) { finish(); return; }
+            try { v.requestVideoFrameCallback(cb); } catch (_) { finish(); }
+        };
+        try { v.muted = true; v.requestVideoFrameCallback(cb); v.play().catch(() => finish()); } catch (_) { finish(); }
+        setTimeout(finish, 1800);
+    });
 }
 
 // Replace the node's package badge ("Floyo-Video-Studio" dark pill) with the Floyo
@@ -401,16 +434,30 @@ async function loadMeta(state, value) {
         }
     } catch (_) {}
 
+    // probe couldn't read fps (a just-uploaded #inputs file) — for a SHORT clip read it
+    // now via a brief muted play (the preview is already buffered, so it's cheap). Long /
+    // large clips are skipped here and filled in passively when the user plays (a forced
+    // play of a heavy 4K file could stutter the UI).
+    const dur = state.meta.duration || 0;
+    if (!fps && v && dur > 0 && dur <= 120) {
+        const measured = await measureFpsForced(state).catch(() => 0);
+        if (token !== state._loadToken) return;
+        if (measured) fps = measured;
+    }
+
     if (state.meta.duration && fps && !frames) frames = Math.round(state.meta.duration * fps);
 
     if (token !== state._loadToken) return;
     state.meta.fps = fps;
     state.meta.frame_count = frames;
-    if (state.srcFps) state.srcFps.textContent = fps ? `${Math.round(fps * 100) / 100}` : "—";
-    if (state.srcFrames) state.srcFrames.textContent = frames ? `${frames}` : "—";
-    // probe couldn't read it (just-uploaded #inputs file) — fill fps in passively the
-    // moment the user plays the preview (no forced play, so a 4K clip won't freeze).
-    if (!fps && v) attachPassiveFps(state, v);
+    // For a long clip whose fps we deliberately didn't force-read, show a play hint
+    // instead of a bare dash; the passive watcher fills the real numbers on play.
+    const fpsPending = !fps && v;
+    if (state.srcFps) { state.srcFps.textContent = fps ? `${Math.round(fps * 100) / 100}` : (fpsPending ? "▶" : "—"); if (fpsPending) state.srcFps.title = "Press play on the preview to read the fps"; }
+    if (state.srcFrames) { state.srcFrames.textContent = frames ? `${frames}` : (fpsPending ? "▶" : "—"); if (fpsPending) state.srcFrames.title = "Press play on the preview to read the frame count"; }
+    // probe couldn't read it (just-uploaded #inputs file) and it was too long to force-
+    // read — fill fps in passively the moment the user plays the preview.
+    if (fpsPending) attachPassiveFps(state, v);
     if (state.meta.width || state.meta.duration) {
         const aud = state.meta.has_audio === undefined ? "" : (state.meta.has_audio ? " · 🔊 audio" : " · no audio");
         state.metaLabel.textContent = `${state.meta.width || "?"}×${state.meta.height || "?"} · ${fmtTime(state.meta.duration)}${aud}`;
