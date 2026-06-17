@@ -33,6 +33,10 @@ function injectStyles() {
         if (document.getElementById(STYLE_ID)) return;
         const css = `
 .fvs-wrap { display:flex; flex-direction:column; gap:9px; padding:8px 9px 10px; box-sizing:border-box; width:100%; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+.fvs-upload { display:flex; align-items:center; justify-content:center; gap:7px; width:100%; padding:8px 10px; background:rgba(96,165,250,0.13); border:1px solid rgba(96,165,250,0.38); border-radius:8px; color:#bfdbfe; font-size:11.5px; font-weight:600; cursor:pointer; box-sizing:border-box; font-family:inherit; transition:background .15s,border-color .15s; }
+.fvs-upload:hover { background:rgba(96,165,250,0.22); border-color:rgba(96,165,250,0.55); }
+.fvs-upload:active { transform:scale(0.99); }
+.fvs-upload .fvs-up-ic { font-size:13px; line-height:1; font-weight:700; }
 .fvs-sec { font-size:9.5px; letter-spacing:.08em; text-transform:uppercase; color:#6b7280; font-weight:600; margin:1px 0 -2px; }
 .fvs-src { display:flex; gap:7px; }
 .fvs-field { display:flex; align-items:center; gap:6px; font-size:11px; flex:1 1 0; min-width:0; }
@@ -135,6 +139,7 @@ function setup(node) {
         const endW = getWidget(node, "end_seconds");
         const targetFpsW = getWidget(node, "target_fps");
         const targetFramesW = getWidget(node, "target_frames");
+        const uploadW = getWidget(node, "upload");
         if (!videoW || !startW || !endW) return;
 
         const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW, targetFramesW };
@@ -143,6 +148,24 @@ function setup(node) {
         const wrap = document.createElement("div");
         wrap.className = "fvs-wrap";
         state.wrap = wrap;
+
+        // ── A clear "choose / upload video" action. The platform's video_upload
+        //    widget only exposes a small folder glyph on the combo, which users miss;
+        //    this button fires the SAME native upload (so the file still lands in the
+        //    managed input dir via Floyo's #inputs flow — no custom upload route). The
+        //    combo above still lets you pick an already-uploaded video.
+        if (uploadW) {
+            const upBtn = document.createElement("button");
+            upBtn.type = "button";
+            upBtn.className = "fvs-upload";
+            upBtn.innerHTML = '<span class="fvs-up-ic" aria-hidden="true">↑</span><span>Choose / upload video</span>';
+            upBtn.title = "Upload a new video, or pick an already-uploaded one from the dropdown above.";
+            upBtn.addEventListener("click", (e) => {
+                e.preventDefault(); e.stopPropagation();
+                try { uploadW.callback(undefined, app.canvas, node, [0, 0], e); } catch (_) {}
+            });
+            wrap.appendChild(upBtn);
+        }
 
         // ── Locked "source video" facts (the real fps + frame count). Look like
         //    fields but are read-only — just so you know what you're working with.
