@@ -94,7 +94,10 @@ function frontendVideo(state) {
 // Replace the node's package badge ("Floyo-Video-Studio" dark pill) with the Floyo
 // wordmark — the badge is a Vue/Tailwind element that re-renders (zoom / pan / select),
 // so we run a guarded sweep behind a debounced observer, installed once globally. The
-// dark pill background is cleared so only the logo shows.
+// dark pill background is cleared so only the logo shows. The wordmark links to
+// floyo.ai (same image + link as the Sticky Note); mousedown is swallowed so the click
+// never starts a LiteGraph node-drag / marquee select.
+const FLOYO_SITE = "https://www.floyo.ai";
 function brandBadges(root) {
     (root || document).querySelectorAll("*").forEach((el) => {
         if (el.__floyoBranded) return;
@@ -107,12 +110,20 @@ function brandBadges(root) {
         img.src = FLOYO_LOGO_DATA_URL;
         img.alt = "Floyo";
         img.draggable = false;
-        img.style.cssText = "height:15px;width:auto;display:block;opacity:0.92;pointer-events:none;";
+        img.style.cssText = "height:15px;width:auto;display:block;opacity:0.92;";
         pill.appendChild(img);
         pill.style.background = "transparent";
         pill.style.padding = "0";
         pill.style.minWidth = "0";
         pill.style.height = "auto";
+        pill.style.cursor = "pointer";
+        pill.title = "Floyo";
+        pill.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+        pill.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            window.open(FLOYO_SITE, "_blank", "noopener,noreferrer");
+        });
     });
 }
 
