@@ -559,19 +559,16 @@ try:
         except Exception as e:
             return web.json_response({"error": str(e)}, status=400)
 
-    @PromptServer.instance.routes.post("/floyo_vs/probe_url")
+    @PromptServer.instance.routes.get("/floyo_vs/probe_url")
     async def _floyo_vs_probe_url(request):
         # Header-only metadata read for a JUST-uploaded clip whose file isn't on the backend
-        # yet (the #inputs case). The browser sends the platform preview-video URL; ffmpeg
+        # yet (the #inputs case). The browser passes the platform preview-video URL; ffmpeg
         # range-fetches only the header, so even a 30-min 4K clip resolves fast with no
-        # decode and no load on the user's device.
+        # decode and no load on the user's device. GET (not POST) because the platform proxy
+        # forwards GET custom-node routes but not POST ones.
         if not _HAS_AV:
             return web.json_response({"error": "PyAV not installed on server."}, status=500)
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        url = (data.get("url") or "").strip()
+        url = (request.query.get("url") or "").strip()
         if not url or not _url_is_safe(url):
             return web.json_response({"error": "Unsupported or unsafe video URL."}, status=400)
         try:
