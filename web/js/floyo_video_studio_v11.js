@@ -78,17 +78,77 @@ function getWidget(node, name) {
 }
 
 // The platform's video_upload widget renders its own <video> preview as a DOM
-// sibling of our wrap. Find it so we can scrub it when the trim handles move.
+// sibling of our wrap. Find it (walk up to the common container, then down) so we can
+// read its metadata AND scrub it when the trim handles move. Fallback: if there's
+// exactly one <video> on the page it's ours.
 function frontendVideo(state) {
     try {
-        let root = state.wrap && state.wrap.parentElement;
-        for (let i = 0; i < 6 && root; i++) {
+        let root = state.wrap;
+        for (let i = 0; i < 14 && root; i++) {
             const v = root.querySelector && root.querySelector("video");
             if (v) return v;
             root = root.parentElement;
         }
+        const all = document.querySelectorAll("video");
+        if (all.length === 1) return all[0];
     } catch (_) {}
     return null;
+}
+
+// Resolve once the preview <video> has real metadata (duration + dimensions). This is
+// the source of truth for a freshly-uploaded video — the platform streams it into the
+// preview immediately, even when the backend file (a #inputs/ upload) isn't fetched yet
+// so the probe can't read it.
+function frontendVideoReady(state, timeoutMs) {
+    timeoutMs = timeoutMs || 6000;
+    return new Promise((resolve) => {
+        const start = frontendVideo(state);
+        const oldSrc = start ? (start.currentSrc || start.src || "") : "";
+        const t0 = Date.now();
+        const ok = (v) => v && v.readyState >= 1 && isFinite(v.duration) && v.duration > 0;
+        const tick = () => {
+            const v = frontendVideo(state);
+            const src = v ? (v.currentSrc || v.src || "") : "";
+            // accept a loaded preview once its source is the NEW clip (so we never read
+            // the previous video's duration); after a short settle accept anyway, which
+            // covers re-selecting the same clip / an unchanged src.
+            if (ok(v) && (src !== oldSrc || Date.now() - t0 > 800)) { resolve(v); return; }
+            if (Date.now() - t0 > timeoutMs) { resolve(ok(v) ? v : null); return; }
+            setTimeout(tick, 120);
+        };
+        setTimeout(tick, 150);   // let the platform swap the <video> src first
+    });
+}
+
+// Measure fps from the preview via requestVideoFrameCallback (a brief muted play). Used
+// only when the backend probe can't read the file (just-uploaded #inputs video). For a
+// constant-rate clip the median inter-frame delta gives an exact fps.
+function measureFps(state) {
+    return new Promise((resolve) => {
+        const v = frontendVideo(state);
+        if (!v || typeof v.requestVideoFrameCallback !== "function") { resolve(0); return; }
+        const times = [];
+        const prevMuted = v.muted, prevTime = v.currentTime || 0, prevPaused = v.paused;
+        let done = false;
+        const finish = () => {
+            if (done) return; done = true;
+            try { if (prevPaused) v.pause(); v.muted = prevMuted; v.currentTime = prevTime; } catch (_) {}
+            if (times.length < 3) { resolve(0); return; }
+            const d = [];
+            for (let i = 1; i < times.length; i++) { const dt = times[i] - times[i - 1]; if (dt > 0) d.push(dt); }
+            if (!d.length) { resolve(0); return; }
+            d.sort((a, b) => a - b);
+            const med = d[Math.floor(d.length / 2)];
+            resolve(med > 0 ? Math.round((1 / med) * 100) / 100 : 0);
+        };
+        const cb = (now, meta) => {
+            times.push(meta && typeof meta.mediaTime === "number" ? meta.mediaTime : v.currentTime);
+            if (times.length >= 9) { finish(); return; }
+            try { v.requestVideoFrameCallback(cb); } catch (_) { finish(); }
+        };
+        try { v.muted = true; v.requestVideoFrameCallback(cb); v.play().catch(() => finish()); } catch (_) { finish(); }
+        setTimeout(finish, 1600);
+    });
 }
 
 // Replace the node's package badge ("Floyo-Video-Studio" dark pill) with the Floyo
@@ -153,7 +213,7 @@ function setup(node) {
         const uploadW = getWidget(node, "upload");
         if (!videoW || !startW || !endW) return;
 
-        const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW, targetFramesW };
+        const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW, targetFramesW, _loadToken: 0 };
         node.__fvs = state;
 
         const wrap = document.createElement("div");
@@ -271,23 +331,72 @@ function setup(node) {
     }
 }
 
+// Load the SELECTED video's real facts. Frontend-first: the preview <video> is the
+// source of truth for duration + size and is available instantly for ANY video (incl. a
+// just-uploaded #inputs/ file the backend hasn't fetched yet). The backend probe adds
+// the precise fps + frame_count; if it can't read the file we measure fps from the
+// preview. Stale values are cleared first so a new upload never shows the old video's
+// numbers.
 async function loadMeta(state, value) {
     if (!value) return;
+    const token = ++state._loadToken;          // guards against an older load finishing late
+    state._loaded = value;
+    state.meta = { duration: 0, fps: 0, frame_count: 0, width: 0, height: 0, has_audio: undefined };
+    if (state.srcFps) state.srcFps.textContent = "…";
+    if (state.srcFrames) state.srcFrames.textContent = "…";
+    state.metaLabel.textContent = "Reading video…";
+    // reset the trim so it can't carry the previous clip's end
+    state.endW.value = 0; state.startW.value = 0;
+    refresh(state);
+
+    // 1) duration + dimensions from the preview <video> — instant, always works
+    let v = null;
+    try { v = await frontendVideoReady(state); } catch (_) {}
+    if (token !== state._loadToken) return;     // a newer selection superseded us
+    if (v) {
+        state.meta.duration = v.duration;
+        state.meta.width = v.videoWidth || 0;
+        state.meta.height = v.videoHeight || 0;
+        state.endW.value = Math.round(v.duration * 100) / 100;
+        state.metaLabel.textContent = `${state.meta.width || "?"}×${state.meta.height || "?"} · ${fmtTime(v.duration)}`;
+        syncFromWidgets(state);
+    }
+
+    // 2) precise fps + frame_count from the backend probe
+    let fps = 0, frames = 0;
     try {
-        state._loaded = value;
         const resp = await api.fetchApi(`/floyo_vs/probe?filename=${encodeURIComponent(value)}`);
         const m = await resp.json();
-        if (!resp.ok || m.error) throw new Error(m.error || "probe failed");
-        state.meta = m;
-        if (state.srcFps) state.srcFps.textContent = `${m.fps}`;
-        if (state.srcFrames) state.srcFrames.textContent = `${m.frame_count}`;
-        state.metaLabel.textContent = `${m.width}×${m.height} · ${fmtTime(m.duration)}${m.has_audio ? " · 🔊 audio" : " · no audio"}`;
-        if ((Number(state.endW.value) || 0) <= 0) state.endW.value = Math.round(m.duration * 100) / 100;
-        syncFromWidgets(state);
-    } catch (e) {
-        state.metaLabel.textContent = "Could not read video info (the trim still works by seconds).";
-        console.error("[Floyo Video Studio] probe:", e);
+        if (token !== state._loadToken) return;
+        if (resp.ok && !m.error) {
+            fps = Number(m.fps) || 0;
+            frames = Number(m.frame_count) || 0;
+            state.meta.has_audio = m.has_audio;
+            if (!state.meta.duration && m.duration) state.meta.duration = m.duration;
+            if (!state.meta.width && m.width) { state.meta.width = m.width; state.meta.height = m.height; }
+        }
+    } catch (_) {}
+
+    // 3) probe couldn't read it (just-uploaded #inputs file) — measure fps from the preview
+    if (!fps && v) {
+        const measured = await measureFps(state).catch(() => 0);
+        if (token !== state._loadToken) return;
+        if (measured) fps = measured;
     }
+    if (state.meta.duration && fps && !frames) frames = Math.round(state.meta.duration * fps);
+
+    if (token !== state._loadToken) return;
+    state.meta.fps = fps;
+    state.meta.frame_count = frames;
+    if (state.srcFps) state.srcFps.textContent = fps ? `${Math.round(fps * 100) / 100}` : "—";
+    if (state.srcFrames) state.srcFrames.textContent = frames ? `${frames}` : "—";
+    if (state.meta.width || state.meta.duration) {
+        const aud = state.meta.has_audio === undefined ? "" : (state.meta.has_audio ? " · 🔊 audio" : " · no audio");
+        state.metaLabel.textContent = `${state.meta.width || "?"}×${state.meta.height || "?"} · ${fmtTime(state.meta.duration)}${aud}`;
+    } else {
+        state.metaLabel.textContent = "Could not read video info (the trim still works by seconds).";
+    }
+    syncFromWidgets(state);
 }
 
 function syncFromWidgets(state) {
