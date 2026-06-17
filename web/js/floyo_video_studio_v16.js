@@ -443,11 +443,12 @@ async function loadMeta(state, value) {
         const url = v.currentSrc || v.src || "";
         if (/^https:\/\//i.test(url)) {
             try {
-                const r = await api.fetchApi("/floyo_vs/probe_url", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ url }),
-                });
+                // GET (the platform proxy forwards GET custom routes, not POST). Abort after
+                // 10s so a slow/hung origin can never freeze the panel — we just fall through.
+                const ctrl = new AbortController();
+                const to = setTimeout(() => ctrl.abort(), 10000);
+                const r = await api.fetchApi("/floyo_vs/probe_url?url=" + encodeURIComponent(url), { signal: ctrl.signal });
+                clearTimeout(to);
                 const m = await r.json();
                 if (token !== state._loadToken) return;
                 if (r.ok && !m.error) {
