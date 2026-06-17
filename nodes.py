@@ -17,6 +17,8 @@ Pure-ish utility — only dependency is PyAV (bundles ffmpeg). No ML.
 
 import asyncio
 import os
+import urllib.error
+import urllib.request
 from fractions import Fraction
 
 import numpy as np
@@ -180,12 +182,75 @@ def _url_is_safe(url):
         return False
 
 
+_PROBE_UA = "Mozilla/5.0 (FloyoVideoStudio)"
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-run the SSRF guard on every redirect hop so a public URL can't 30x-bounce the
+    fetch onto an internal address (e.g. cloud metadata)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _url_is_safe(newurl):
+            raise urllib.error.HTTPError(newurl, code, "Unsafe redirect target", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _HttpRangeReader:
+    """Seekable file-like that range-fetches over HTTPS via urllib. jacob's bundled ffmpeg
+    has no network protocols, but Python does — so Python pulls the bytes and ffmpeg seeks
+    to + reads ONLY the moov/header through this object. Probing a remote clip then costs a
+    handful of range requests + ~100 KB regardless of the clip's length. Requires the
+    origin to honour HTTP Range (206); otherwise it bails so we never pull a whole file."""
+
+    def __init__(self, url):
+        self.url = url
+        self.pos = 0
+        self._opener = urllib.request.build_opener(_SafeRedirectHandler())
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-0", "User-Agent": _PROBE_UA})
+        with self._opener.open(req, timeout=15) as r:
+            if getattr(r, "status", 200) != 206:
+                raise ValueError("Origin does not support HTTP Range requests.")
+            cr = r.headers.get("Content-Range", "")
+            self.size = int(cr.split("/")[-1]) if "/" in cr else int(r.headers.get("Content-Length") or 0)
+        if self.size <= 0:
+            raise ValueError("Could not determine remote video size.")
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            n = self.size - self.pos
+        if n <= 0 or self.pos >= self.size:
+            return b""
+        end = min(self.pos + n, self.size) - 1
+        req = urllib.request.Request(
+            self.url, headers={"Range": f"bytes={self.pos}-{end}", "User-Agent": _PROBE_UA})
+        with self._opener.open(req, timeout=15) as r:
+            data = r.read()
+        self.pos += len(data)
+        return data
+
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            self.pos = offset
+        elif whence == 1:
+            self.pos += offset
+        elif whence == 2:
+            self.pos = self.size + offset
+        return self.pos
+
+    def tell(self):
+        return self.pos
+
+    def seekable(self):
+        return True
+
+
 def _probe_url(url):
-    """Read fps/frame_count/duration/dims from a remote video's HEADER over HTTP. ffmpeg
-    range-fetches just the moov/header (no full download, no decode), so it stays fast +
-    light even for a 20-30 min 4K clip — and runs server-side, costing the user's device
-    nothing. Used for freshly-uploaded #inputs videos not yet on the backend disk."""
-    with av.open(url, timeout=20) as c:
+    """Read fps/frame_count/duration/dims from a remote video's HEADER over HTTPS without
+    downloading it. A urllib-backed seekable reader feeds ffmpeg, which seeks to + reads
+    only the moov — a few range requests + ~100 KB even for a 20-30 min 4K clip — and runs
+    server-side, so the user's device does nothing. Used for freshly-uploaded #inputs
+    videos not yet on the backend disk."""
+    with av.open(_HttpRangeReader(url)) as c:
         return _meta_from_container(c)
 
 
