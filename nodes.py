@@ -15,6 +15,7 @@ into Floyo's video-to-video AI nodes and Save Video. `frames` is for per-frame w
 Pure-ish utility — only dependency is PyAV (bundles ffmpeg). No ML.
 """
 
+import asyncio
 import os
 from fractions import Fraction
 
@@ -125,28 +126,67 @@ def _fmt_time(s):
     return f"{m:02d}:{sec:04.1f}"
 
 
-def _probe(path):
-    """Fast metadata read (no full decode): duration, fps, width, height, frame_count."""
-    with av.open(path) as c:
-        if not c.streams.video:
-            raise ValueError("File has no video stream.")
-        v = c.streams.video[0]
-        width = int(v.codec_context.width or v.width or 0)
-        height = int(v.codec_context.height or v.height or 0)
-        fps = float(v.average_rate) if v.average_rate else (float(v.base_rate) if v.base_rate else 0.0)
-        if c.duration:
-            duration = float(c.duration) / float(av.time_base)
-        elif v.duration and v.time_base:
-            duration = float(v.duration * v.time_base)
-        else:
-            duration = 0.0
-        frame_count = int(v.frames) if v.frames else (int(round(duration * fps)) if fps else 0)
-        has_audio = len(c.streams.audio) > 0
+def _meta_from_container(c):
+    """Pull duration, fps, dims, frame_count, has_audio from an OPEN av container.
+    Reads header only — no decode — so it is cheap regardless of clip length."""
+    if not c.streams.video:
+        raise ValueError("File has no video stream.")
+    v = c.streams.video[0]
+    width = int(v.codec_context.width or v.width or 0)
+    height = int(v.codec_context.height or v.height or 0)
+    fps = float(v.average_rate) if v.average_rate else (float(v.base_rate) if v.base_rate else 0.0)
+    if c.duration:
+        duration = float(c.duration) / float(av.time_base)
+    elif v.duration and v.time_base:
+        duration = float(v.duration * v.time_base)
+    else:
+        duration = 0.0
+    frame_count = int(v.frames) if v.frames else (int(round(duration * fps)) if fps else 0)
+    has_audio = len(c.streams.audio) > 0
     return {
         "width": width, "height": height,
         "fps": round(fps, 4), "duration": round(duration, 4),
         "frame_count": frame_count, "has_audio": has_audio,
     }
+
+
+def _probe(path):
+    """Fast metadata read (no full decode): duration, fps, width, height, frame_count."""
+    with av.open(path) as c:
+        return _meta_from_container(c)
+
+
+def _url_is_safe(url):
+    """SSRF guard for the probe-by-URL route. Only https, and the host must resolve to a
+    PUBLIC ip (reject loopback/private/link-local/reserved) so it can't be aimed at an
+    internal service. The url is the platform's own preview-video url the browser loaded."""
+    try:
+        from urllib.parse import urlparse
+        import socket
+        import ipaddress
+        p = urlparse(url)
+        if p.scheme != "https" or not p.hostname:
+            return False
+        infos = socket.getaddrinfo(p.hostname, p.port or 443, type=socket.SOCK_STREAM)
+        if not infos:
+            return False
+        for _fam, _stype, _proto, _canon, sockaddr in infos:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _probe_url(url):
+    """Read fps/frame_count/duration/dims from a remote video's HEADER over HTTP. ffmpeg
+    range-fetches just the moov/header (no full download, no decode), so it stays fast +
+    light even for a 20-30 min 4K clip — and runs server-side, costing the user's device
+    nothing. Used for freshly-uploaded #inputs videos not yet on the backend disk."""
+    with av.open(url, timeout=20) as c:
+        return _meta_from_container(c)
 
 
 def _silent_audio(sample_rate=44100):
@@ -451,6 +491,28 @@ try:
         try:
             path = _safe_input_path(name)
             return web.json_response(_probe(path))
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+    @PromptServer.instance.routes.post("/floyo_vs/probe_url")
+    async def _floyo_vs_probe_url(request):
+        # Header-only metadata read for a JUST-uploaded clip whose file isn't on the backend
+        # yet (the #inputs case). The browser sends the platform preview-video URL; ffmpeg
+        # range-fetches only the header, so even a 30-min 4K clip resolves fast with no
+        # decode and no load on the user's device.
+        if not _HAS_AV:
+            return web.json_response({"error": "PyAV not installed on server."}, status=500)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        url = (data.get("url") or "").strip()
+        if not url or not _url_is_safe(url):
+            return web.json_response({"error": "Unsupported or unsafe video URL."}, status=400)
+        try:
+            loop = asyncio.get_running_loop()
+            meta = await loop.run_in_executor(None, _probe_url, url)
+            return web.json_response(meta)
         except Exception as e:
             return web.json_response({"error": str(e)}, status=400)
 except Exception:

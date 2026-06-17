@@ -434,10 +434,37 @@ async function loadMeta(state, value) {
         }
     } catch (_) {}
 
-    // probe couldn't read fps (a just-uploaded #inputs file) — for a SHORT clip read it
-    // now via a brief muted play (the preview is already buffered, so it's cheap). Long /
-    // large clips are skipped here and filled in passively when the user plays (a forced
-    // play of a heavy 4K file could stutter the UI).
+    // 2b) probe still blank → a just-uploaded #inputs file isn't on the backend disk yet.
+    // Ask the backend to read the header straight from the preview video's URL: ffmpeg
+    // range-fetches ONLY the moov/header (no full download, no decode), so it resolves fast
+    // and light for ANY length — 20-30 min 4K included — and runs server-side, so a
+    // low-end device does zero work. This is the primary path for uploaded clips.
+    if (!fps && v) {
+        const url = v.currentSrc || v.src || "";
+        if (/^https:\/\//i.test(url)) {
+            try {
+                const r = await api.fetchApi("/floyo_vs/probe_url", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ url }),
+                });
+                const m = await r.json();
+                if (token !== state._loadToken) return;
+                if (r.ok && !m.error) {
+                    fps = Number(m.fps) || fps;
+                    frames = Number(m.frame_count) || frames;
+                    if (state.meta.has_audio === undefined) state.meta.has_audio = m.has_audio;
+                    if (!state.meta.duration && m.duration) state.meta.duration = m.duration;
+                    if (!state.meta.width && m.width) { state.meta.width = m.width; state.meta.height = m.height; }
+                }
+            } catch (_) {}
+        }
+    }
+
+    // 3) last resort: the backend couldn't reach the URL either (e.g. it needs the browser's
+    // auth). For a SHORT clip read fps via a brief muted play (the preview is already
+    // buffered, so it's cheap). Long / large clips are skipped here and filled passively
+    // when the user plays (a forced play of a heavy 4K file could stutter the UI).
     const dur = state.meta.duration || 0;
     if (!fps && v && dur > 0 && dur <= 120) {
         const measured = await measureFpsForced(state).catch(() => 0);
