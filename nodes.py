@@ -9,11 +9,15 @@ Design goals (why this exists vs VideoHelperSuite):
   * NO FILE PATHS: input is an upload-widget filename resolved inside ComfyUI's
     managed input dir (with a traversal guard); paths are never returned or echoed.
 
-Outputs: frames (IMAGE), audio (AUDIO), fps, width, height, duration, frame_count, info.
+Outputs: video (VIDEO), frames (IMAGE), audio (AUDIO), fps (FLOAT), frame_count (INT).
+The `video` output is a real, trimmed + downscaled video object — it plugs straight
+into Floyo's video-to-video AI nodes and Save Video. `frames` is for per-frame work.
 Pure-ish utility — only dependency is PyAV (bundles ffmpeg). No ML.
 """
 
 import os
+from fractions import Fraction
+
 import numpy as np
 import torch
 
@@ -36,6 +40,26 @@ try:
     _HAS_DECORD = True
 except Exception:
     _HAS_DECORD = False
+
+# Native ComfyUI VIDEO type (comfy_api). Lets us hand downstream nodes a real `video`
+# object — the trim + downscale + fps the user picked, baked in — that plugs straight
+# into Floyo's video-to-video AI nodes (Kling / Krea / Grok / Pixverse / Lightx) and
+# Save Video. It's LAZY: the frames are only encoded when a downstream node actually
+# saves / uploads the video, so adding this output costs nothing at run time. Guarded
+# so the module still imports on a frontend backend that lacks comfy_api (the static
+# RETURN_TYPES below still advertises the port; only execution needs the real API).
+try:
+    from comfy_api.input_impl import VideoFromComponents
+    from comfy_api.util import VideoComponents
+    _HAS_VIDEO_API = True
+except Exception:
+    try:
+        from comfy_api.latest import InputImpl as _ImplNS, Types as _TypesNS
+        VideoFromComponents = _ImplNS.VideoFromComponents
+        VideoComponents = _TypesNS.VideoComponents
+        _HAS_VIDEO_API = True
+    except Exception:
+        _HAS_VIDEO_API = False
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg", ".gif")
 QUALITY_PRESETS = {"Source": None, "1080p": 1080, "720p": 720, "480p": 480}
@@ -220,10 +244,12 @@ class FloyoVideoStudio:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "FLOAT", "INT")
-    RETURN_NAMES = ("frames", "audio", "fps", "frame_count")
+    RETURN_TYPES = ("VIDEO", "IMAGE", "AUDIO", "FLOAT", "INT")
+    RETURN_NAMES = ("video", "frames", "audio", "fps", "frame_count")
     OUTPUT_TOOLTIPS = (
-        "Extracted frames (image batch) — wire to your image / AI / Video Combine nodes.",
+        "The trimmed + downscaled video — wire it straight into a video-to-video AI node "
+        "(Kling / Krea / Grok / Pixverse / Lightx…) or Save Video. Carries the audio too.",
+        "Extracted frames (image batch) — for per-frame AI / upscale / Video Combine.",
         "Trimmed audio (silent if none / disabled).",
         "Output frames-per-second — wire to Video Combine's frame_rate so the rebuilt video plays at the right speed.",
         "Output frame count.",
@@ -369,11 +395,28 @@ class FloyoVideoStudio:
         audio = _extract_audio(path, start, end) if include_audio else _silent_audio()
         frame_count = int(images.shape[0])
 
-        # Clean output set (matches Floyo's "Video URL to Frames" node): the frames,
-        # their audio, the fps (for Video Combine's frame_rate), and the count. The
-        # trim/quality the user picked are already baked into the frames — width /
-        # height / duration are redundant, so they're not separate outputs.
-        return (images, audio, float(out_fps), frame_count)
+        # Assemble the headline `video` output: the exact frames we kept (trim +
+        # downscale baked in) at the output fps, with the trimmed audio muxed in. This
+        # is a lazy container — nothing is encoded until a downstream node saves or
+        # uploads it — so it's free to hand out alongside the raw frames. A node that
+        # only wants frames simply ignores this port. Only attach real audio (skip the
+        # 1-sample silent placeholder) so a no-audio clip yields a clean silent video.
+        video_out = None
+        if _HAS_VIDEO_API:
+            try:
+                vid_audio = audio if (include_audio and meta.get("has_audio")) else None
+                video_out = VideoFromComponents(VideoComponents(
+                    images=images,
+                    audio=vid_audio,
+                    frame_rate=Fraction(out_fps).limit_denominator(1000000),
+                ))
+            except Exception:
+                video_out = None
+
+        # video → for video-to-video AI / Save Video; frames → per-frame work; plus the
+        # audio, the fps (Video Combine's frame_rate) and the count. The trim/quality
+        # the user picked are already baked in, so width/height/duration aren't outputs.
+        return (video_out, images, audio, float(out_fps), frame_count)
 
 
 # ───────────────────────── server route (metadata for the JS slider) ─────────────────────────
