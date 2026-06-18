@@ -274,6 +274,7 @@ function overlayScrub(state, v) {
 function tagScrubVideo(state, v) {
     try {
         if (!v) return v;
+        state.scrubVideo = v;            // cache so onScrub doesn't DOM-walk per input
         makeSeekable(state, v);
         overlayScrub(state, v);
         if (v.__floyoScrub) return v;
@@ -560,15 +561,26 @@ function setup(node) {
         wrap.appendChild(sTime);
         state.sRange = sRange; state.sFill = sFill; state.sTime = sTime; state.scrubHead = scrubHead;
 
-        const onScrub = () => {
-            const v = frontendVideo(state);
+        // Smooth scrubbing: update the fill INSTANTLY on every input (cheap), but throttle the
+        // actual video seek to one per animation frame and use fastSeek (nearest keyframe) so
+        // the decoder keeps up. Reuse the cached video — no DOM walk per input.
+        let scrubRaf = 0, scrubFrac = 0;
+        const applyScrub = (precise) => {
+            let v = state.scrubVideo;
+            if (!v || !v.isConnected) v = frontendVideo(state);
             if (!v || !(v.duration > 0)) return;
-            const f = parseFloat(sRange.value) || 0;
-            try { v.currentTime = f * v.duration; } catch (_) {}
-            sFill.style.width = (f * 100) + "%";
-            sTime.textContent = fmtTime(f * v.duration) + " / " + fmtTime(v.duration);
+            const t = scrubFrac * v.duration;
+            try { if (!precise && typeof v.fastSeek === "function") v.fastSeek(t); else v.currentTime = t; }
+            catch (_) { try { v.currentTime = t; } catch (_) {} }
+            sTime.textContent = fmtTime(t) + " / " + fmtTime(v.duration);
+        };
+        const onScrub = () => {
+            scrubFrac = parseFloat(sRange.value) || 0;
+            sFill.style.width = (scrubFrac * 100) + "%";
+            if (!scrubRaf) scrubRaf = requestAnimationFrame(() => { scrubRaf = 0; applyScrub(false); });
         };
         sRange.addEventListener("input", onScrub);
+        sRange.addEventListener("change", () => applyScrub(true));
 
         const onSlide = () => {
             const dur = state.meta.duration || 1;
