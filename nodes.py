@@ -16,6 +16,7 @@ Pure-ish utility — only dependency is PyAV (bundles ffmpeg). No ML.
 """
 
 import asyncio
+import io
 import os
 import urllib.error
 import urllib.request
@@ -244,14 +245,32 @@ class _HttpRangeReader:
         return True
 
 
+def _probe_url_head(url, cap=16 * 1024 * 1024):
+    """No-Range fallback: a plain GET, read only the first `cap` bytes, parse from memory.
+    A web/uploaded clip is almost always 'faststart' (moov at the front), so the header is
+    in the first few MB — we stop reading there and never pull the whole file."""
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    req = urllib.request.Request(url, headers={"User-Agent": _PROBE_UA})
+    with opener.open(req, timeout=15) as r:
+        head = r.read(cap)
+    with av.open(io.BytesIO(head)) as c:
+        return _meta_from_container(c)
+
+
 def _probe_url(url):
     """Read fps/frame_count/duration/dims from a remote video's HEADER over HTTPS without
-    downloading it. A urllib-backed seekable reader feeds ffmpeg, which seeks to + reads
-    only the moov — a few range requests + ~100 KB even for a 20-30 min 4K clip — and runs
-    server-side, so the user's device does nothing. Used for freshly-uploaded #inputs
-    videos not yet on the backend disk."""
-    with av.open(_HttpRangeReader(url)) as c:
-        return _meta_from_container(c)
+    downloading it — server-side, so the user's device does nothing even for a 20-30 min 4K
+    clip. Preferred path: a urllib-backed seekable reader feeds ffmpeg, which seeks to +
+    reads only the moov (a few range requests, ~100 KB, any moov location). If the origin
+    won't honour Range, fall back to reading just the faststart head into memory. Used for
+    freshly-uploaded #inputs videos not yet on the backend disk."""
+    try:
+        with av.open(_HttpRangeReader(url)) as c:
+            return _meta_from_container(c)
+    except ValueError as e:
+        if "Range" not in str(e):
+            raise
+    return _probe_url_head(url)
 
 
 def _silent_audio(sample_rate=44100):
