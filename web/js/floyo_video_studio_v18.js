@@ -104,6 +104,106 @@ function protectVideos(root) {
     try { (root || document).querySelectorAll("video").forEach(protectVideo); } catch (_) {}
 }
 
+// ── Browser-side MP4/MOV header parse (exact fps + frame_count for uploaded clips) ──
+// The platform's preview-video URLs are auth'd, so the BACKEND can't read them (401). But
+// the browser already loaded the clip, so we fetch the bytes here. The origin ignores Range
+// and 200s the whole file, so we STREAM and abort once the moov box is complete (uploads are
+// faststart → moov at the front → a few hundred KB, no decode, no GPU — fine on low-end).
+function _fvsConcat(chunks, total) {
+    const buf = new Uint8Array(total); let o = 0;
+    for (const c of chunks) { buf.set(c, o); o += c.length; }
+    return buf;
+}
+function _fvsMoovEnd(buf, total) {
+    // byte offset where the top-level moov box ends, or -1 if not yet present
+    const dv = new DataView(buf.buffer, buf.byteOffset, total);
+    let pos = 0;
+    while (pos + 16 <= total) {
+        let sz = dv.getUint32(pos);
+        const t = String.fromCharCode(dv.getUint8(pos + 4), dv.getUint8(pos + 5), dv.getUint8(pos + 6), dv.getUint8(pos + 7));
+        if (sz === 1) sz = dv.getUint32(pos + 8) * 4294967296 + dv.getUint32(pos + 12);
+        if (t === "moov") return pos + sz;
+        if (sz < 8) return -1;
+        pos += sz;
+    }
+    return -1;
+}
+function _fvsParseMoov(buf) {
+    try {
+        const total = buf.length;
+        const dv = new DataView(buf.buffer, buf.byteOffset, total);
+        const u32 = (p) => dv.getUint32(p);
+        const fourcc = (p) => String.fromCharCode(dv.getUint8(p), dv.getUint8(p + 1), dv.getUint8(p + 2), dv.getUint8(p + 3));
+        const boxtype = (p) => fourcc(p + 4); // box TYPE is at boxStart+4 (size is at +0)
+        let pos = 0, ms = -1, me = -1;
+        while (pos + 8 <= total) {
+            let sz = u32(pos); const t = boxtype(pos); let hl = 8;
+            if (sz === 1) { sz = u32(pos + 8) * 4294967296 + u32(pos + 12); hl = 16; }
+            if (t === "moov") { ms = pos + hl; me = Math.min(pos + sz, total); break; }
+            if (sz < 8) break; pos += sz;
+        }
+        if (ms < 0) return null;
+        const traks = [];
+        const walk = (s, e, f) => {
+            let p = s; f = f || {};
+            while (p + 8 <= e) {
+                let sz = u32(p); const t = boxtype(p); let hl = 8;
+                if (sz === 1) { sz = u32(p + 8) * 4294967296 + u32(p + 12); hl = 16; }
+                if (sz < 8 || p + sz > e) sz = e - p;
+                const cs = p + hl, ce = Math.min(p + sz, e);
+                if (t === "trak") { const tf = {}; walk(cs, ce, tf); traks.push(tf); }
+                else if (t === "mdia" || t === "minf" || t === "stbl") walk(cs, ce, f);
+                // QuickTime has 2 hdlr per trak (media 'vide'/'soun' in mdia, data 'alis' in
+                // minf) — keep the FIRST (the media handler, which comes first).
+                else if (t === "hdlr" && !f.handler) f.handler = fourcc(cs + 8);
+                else if (t === "mdhd" && !f.timescale) {
+                    const ver = dv.getUint8(cs);
+                    if (ver === 1) { f.timescale = u32(cs + 20); f.mdur = u32(cs + 24) * 4294967296 + u32(cs + 28); }
+                    else { f.timescale = u32(cs + 12); f.mdur = u32(cs + 16); }
+                }
+                else if (t === "stts") {
+                    const ec = u32(cs + 4); let tot = 0, best = { sc: 0, sd: 0 };
+                    for (let i = 0; i < ec && cs + 8 + i * 8 + 8 <= ce; i++) {
+                        const sc = u32(cs + 8 + i * 8), sd = u32(cs + 8 + i * 8 + 4);
+                        tot += sc; if (sc > best.sc) best = { sc, sd };
+                    }
+                    f.sttsTotal = tot; f.sttsDelta = best.sd;
+                }
+                else if (t === "stsz" && !f.sampleCount) f.sampleCount = u32(cs + 8);
+                p += sz;
+            }
+        };
+        walk(ms, me, null);
+        const vid = traks.find((t) => t.handler === "vide");
+        if (!vid || !vid.timescale) return null;
+        const fps = vid.sttsDelta > 0 ? Math.round((vid.timescale / vid.sttsDelta) * 1000) / 1000 : 0;
+        const frames = vid.sampleCount || vid.sttsTotal || 0;
+        const duration = (vid.mdur && vid.timescale) ? vid.mdur / vid.timescale : 0;
+        if (!fps && !frames) return null;
+        return { fps, frames, duration: Math.round(duration * 10000) / 10000 };
+    } catch (_) { return null; }
+}
+async function probeViaBrowser(url, cancelled) {
+    try {
+        const ctrl = new AbortController();
+        const r = await fetch(url, { signal: ctrl.signal });
+        if (!r.ok && r.status !== 206) { try { ctrl.abort(); } catch (_) {} return null; }
+        const reader = r.body.getReader();
+        const chunks = []; let total = 0, moovEnd = -1;
+        const CAP = 6 * 1024 * 1024; // safety: a faststart moov is well under this
+        while (total < CAP) {
+            if (cancelled && cancelled()) { try { ctrl.abort(); } catch (_) {} return null; }
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value); total += value.length;
+            if (moovEnd < 0) moovEnd = _fvsMoovEnd(_fvsConcat(chunks, total), total);
+            if (moovEnd > 0 && total >= moovEnd) break; // got the whole moov — stop downloading
+        }
+        try { ctrl.abort(); } catch (_) {}
+        return _fvsParseMoov(_fvsConcat(chunks, total));
+    } catch (_) { return null; }
+}
+
 // Hide the (canvas-captured) native seek bar on OUR preview video and mirror its playback
 // into our scrub range, so the user can scrub via a control LiteGraph doesn't swallow.
 // Scoped to our node's video (called from frontendVideo, which has state); attach once.
@@ -490,29 +590,21 @@ async function loadMeta(state, value) {
         }
     } catch (_) {}
 
-    // 2b) probe still blank → a just-uploaded #inputs file isn't on the backend disk yet.
-    // Ask the backend to read the header straight from the preview video's URL: ffmpeg
-    // range-fetches ONLY the moov/header (no full download, no decode), so it resolves fast
-    // and light for ANY length — 20-30 min 4K included — and runs server-side, so a
-    // low-end device does zero work. This is the primary path for uploaded clips.
+    // 2b) probe still blank → a just-uploaded #inputs file isn't on the backend disk yet,
+    // and the platform's preview-video URL is AUTH'd (the backend gets 401 fetching it).
+    // The browser already loaded the clip, so parse its MP4/MOV header HERE: stream only the
+    // moov (uploads are faststart) and read EXACT fps + frame_count — a few hundred KB, no
+    // decode, no GPU. Works for any length (20-30 min 4K) on low-end devices.
     if (!fps && v) {
         const url = v.currentSrc || v.src || "";
-        if (/^https:\/\//i.test(url)) {
+        if (/^(https?:|blob:)/i.test(url)) {
             try {
-                // GET (the platform proxy forwards GET custom routes, not POST). Abort after
-                // 10s so a slow/hung origin can never freeze the panel — we just fall through.
-                const ctrl = new AbortController();
-                const to = setTimeout(() => ctrl.abort(), 10000);
-                const r = await api.fetchApi("/floyo_vs/probe_url?url=" + encodeURIComponent(url), { signal: ctrl.signal });
-                clearTimeout(to);
-                const m = await r.json();
+                const m = await probeViaBrowser(url, () => token !== state._loadToken);
                 if (token !== state._loadToken) return;
-                if (r.ok && !m.error) {
+                if (m) {
                     fps = Number(m.fps) || fps;
-                    frames = Number(m.frame_count) || frames;
-                    if (state.meta.has_audio === undefined) state.meta.has_audio = m.has_audio;
+                    frames = Number(m.frames) || frames;
                     if (!state.meta.duration && m.duration) state.meta.duration = m.duration;
-                    if (!state.meta.width && m.width) { state.meta.width = m.width; state.meta.height = m.height; }
                 }
             } catch (_) {}
         }
