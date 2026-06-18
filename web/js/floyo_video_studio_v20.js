@@ -493,6 +493,14 @@ function setup(node) {
         const sFill = document.createElement("div"); sFill.className = "fvs-fill"; sFill.style.left = "0%"; sFill.style.width = "0%";
         const sRange = document.createElement("input"); sRange.type = "range"; sRange.className = "fvs-range";
         sRange.min = "0"; sRange.max = "1"; sRange.step = "0.0001"; sRange.value = "0";
+        // The shared .fvs-range sets pointer-events:none on the track (needed only so the TWO
+        // overlapping trim handles don't block each other) — that left just the tiny 14px
+        // thumb grabbable, so this single scrub bar couldn't be dragged. Make the WHOLE bar
+        // interactive, and stop the drag from bubbling to the LiteGraph canvas (which would
+        // pan the node instead of seeking).
+        sRange.style.pointerEvents = "auto";
+        ["pointerdown", "pointermove", "pointerup", "mousedown", "mousemove", "mouseup", "touchstart", "touchmove", "touchend"]
+            .forEach((ev) => sRange.addEventListener(ev, (e) => e.stopPropagation(), { passive: true }));
         scrub.append(sTrack, sFill, sRange);
         wrap.appendChild(scrub);
         const sTime = document.createElement("div"); sTime.className = "fvs-scrub-time"; sTime.textContent = "00:00.0 / 00:00.0";
