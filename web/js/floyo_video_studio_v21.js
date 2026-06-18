@@ -58,6 +58,8 @@ function injectStyles() {
 .fvs-mode .fvs-on { color:#34d399; font-weight:600; }
 .fvs-mode .fvs-off { color:#f59e0b; }
 .fvs-meta { font-size:11px; color:#9ca3af; min-height:14px; }
+.fvs-scrub-overlay { position:absolute; left:8px; right:8px; bottom:42px; z-index:30; background:rgba(0,0,0,0.55); border-radius:8px; padding:1px 10px 3px; box-shadow:0 1px 6px rgba(0,0,0,0.45); }
+.fvs-scrub-overlay .fvs-scrub-time { color:#e5e7eb; text-align:left; }
 .fvs-scrub-time { font-size:10px; color:#9ca3af; margin-top:1px; font-variant-numeric:tabular-nums; }
 /* The native <video> seek bar gets captured by the LiteGraph canvas (can't drag to scrub),
    so we hide it on OUR preview and drive playback from the range input below, which works. */
@@ -219,10 +221,61 @@ async function probeViaBrowser(url, cancelled) {
 // Hide the (canvas-captured) native seek bar on OUR preview video and mirror its playback
 // into our scrub range, so the user can scrub via a control LiteGraph doesn't swallow.
 // Scoped to our node's video (called from frontendVideo, which has state); attach once.
+// The platform serves preview videos WITHOUT working HTTP Range, so they aren't seekable
+// (seekable.end === 0; currentTime snaps back to 0). Fetch the whole clip into a blob —
+// blob: URLs ARE seekable — and swap the src so the scrub bar can actually move the video.
+// Capped so we never blow up memory on a huge clip; the small download is one-time.
+function makeSeekable(state, v) {
+    (async () => {
+        try {
+            if (!v || v.__floyoSeek) return;
+            v.__floyoSeek = "checking";
+            await new Promise((r) => setTimeout(r, 700));
+            if (v.seekable && v.seekable.length && v.seekable.end(0) > 0.5) { v.__floyoSeek = "native"; return; }
+            const url = v.currentSrc || v.src || "";
+            if (!/^https?:/i.test(url)) { v.__floyoSeek = "skip"; return; }
+            v.__floyoSeek = "loading";
+            if (state.sTime) state.sTime.textContent = "preparing scrub…";
+            const r = await fetch(url);
+            const len = +(r.headers.get("content-length") || 0);
+            if (len && len > 800 * 1024 * 1024) { try { r.body.cancel(); } catch (_) {} v.__floyoSeek = "toobig"; return; }
+            const blob = await r.blob();
+            if (v.__floyoSeek !== "loading" || !v.isConnected) return;
+            const t = v.currentTime, playing = !v.paused;
+            if (v.__floyoBlobUrl) { try { URL.revokeObjectURL(v.__floyoBlobUrl); } catch (_) {} }
+            v.__floyoBlobUrl = URL.createObjectURL(blob);
+            v.src = v.__floyoBlobUrl; v.load();
+            v.addEventListener("loadedmetadata", () => { try { v.currentTime = t; if (playing) v.play(); } catch (_) {} }, { once: true });
+            v.__floyoSeek = "seekable";
+        } catch (_) { if (v) v.__floyoSeek = "error"; }
+    })();
+}
+
+// Move the scrub bar INTO the preview video (overlay it across the bottom), so it reads as
+// the video's own seek bar. Re-homes on each call so it follows the video if it re-renders.
+function overlayScrub(state, v) {
+    try {
+        const box = v && v.parentElement;
+        const slider = state.sRange && state.sRange.closest(".fvs-slider");
+        if (!box || !slider || !state.sTime) return;
+        let ov = state.scrubOverlay;
+        if (!ov) {
+            ov = document.createElement("div");
+            ov.className = "fvs-scrub-overlay";
+            ov.append(slider, state.sTime);
+            state.scrubOverlay = ov;
+            if (state.scrubHead) state.scrubHead.style.display = "none";
+        }
+        if (getComputedStyle(box).position === "static") box.style.position = "relative";
+        if (ov.parentElement !== box) box.appendChild(ov);
+    } catch (_) {}
+}
+
 function tagScrubVideo(state, v) {
     try {
         if (!v) return v;
-        v.classList.add("fvs-noseek");
+        makeSeekable(state, v);
+        overlayScrub(state, v);
         if (v.__floyoScrub) return v;
         v.__floyoScrub = true;
         const upd = () => {
@@ -505,7 +558,7 @@ function setup(node) {
         wrap.appendChild(scrub);
         const sTime = document.createElement("div"); sTime.className = "fvs-scrub-time"; sTime.textContent = "00:00.0 / 00:00.0";
         wrap.appendChild(sTime);
-        state.sRange = sRange; state.sFill = sFill; state.sTime = sTime;
+        state.sRange = sRange; state.sFill = sFill; state.sTime = sTime; state.scrubHead = scrubHead;
 
         const onScrub = () => {
             const v = frontendVideo(state);
