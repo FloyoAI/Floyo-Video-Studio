@@ -355,14 +355,18 @@ def _is_av1(path):
     return False
 
 
-def _transcode_av1_window(path, start, end):
-    """The backend's PyAV/ffmpeg has no working AV1 decoder. imageio-ffmpeg, however, ships
-    a SELF-CONTAINED ffmpeg that includes dav1d. Use it (independently — PyAV and every other
-    dependency stay untouched) to transcode JUST the trim window of an AV1 clip into a temp
-    H.264 file, which the normal decode path then handles. Returns the temp path; its timeline
-    is 0-based (so the caller decodes it with start=0). Keyframe-aligned seek (fast)."""
+def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target):
+    """Decode an AV1 trim window STRAIGHT to scaled RGB frames using imageio-ffmpeg's
+    bundled dav1d ffmpeg — NO H.264 re-encode (re-encoding 4K with libx264 on CPU was the
+    3–4 min slowdown). One ffmpeg pass seeks to `start`, scales to tw×th, and pipes raw
+    rgb24; we read tw*th*3-byte frames into numpy. Independent: PyAV and every other
+    dependency stay untouched (the backend's PyAV has only a stub AV1 decoder).
+
+    Exact-N mode (n_target>0): decode the window at source cadence, then pick exactly
+    n_target frames evenly (centre-of-segment) — matches the PyAV/decord sampling.
+    fps mode: let ffmpeg's `fps` filter resample to out_fps in the same pass.
+    Returns a list of (th, tw, 3) uint8 arrays."""
     import subprocess
-    import uuid as _uuid
     try:
         import imageio_ffmpeg
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -371,20 +375,52 @@ def _transcode_av1_window(path, start, end):
             "This is an AV1 video and the backend can't decode it. Add the independent "
             "decoder once (nothing else changes): pip install imageio-ffmpeg "
             f"(it bundles a dav1d ffmpeg). [{ex}]")
-    tdir = folder_paths.get_temp_directory()
+    tw, th = int(tw), int(th)
+    start = max(0.0, float(start))
+    dur = max(0.04, float(end) - start)
+    vf = f"scale={tw}:{th}:flags=area"
+    if not (n_target and n_target > 0):  # fps mode → resample in-ffmpeg (cheap, no re-encode)
+        vf += f",fps={max(1e-3, float(out_fps)):.6f}"
+    cmd = [ffmpeg, "-v", "error", "-nostdin", "-ss", f"{start:.3f}", "-i", path,
+           "-t", f"{dur:.3f}", "-an", "-sn", "-vf", vf,
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    fsz = tw * th * 3
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    frames = []
     try:
-        os.makedirs(tdir, exist_ok=True)
-    except Exception:
-        pass
-    tmp = os.path.join(tdir, f"fvs_av1_{_uuid.uuid4().hex}.mp4")
-    dur = max(0.04, float(end) - float(start))
-    cmd = [ffmpeg, "-y", "-v", "error", "-ss", f"{float(start):.3f}", "-i", path,
-           "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-           "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", tmp]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
-        raise RuntimeError(f"AV1 transcode failed: {(r.stderr or '').strip()[-400:]}")
-    return tmp
+        while True:
+            buf = proc.stdout.read(fsz)
+            if not buf or len(buf) < fsz:
+                break
+            frames.append(np.frombuffer(buf, dtype=np.uint8).reshape(th, tw, 3))
+            if len(frames) >= _ALL_FRAMES_SAFETY_CAP:
+                break  # internal guard so a huge clip can't OOM
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        err = b""
+        try:
+            err = proc.stderr.read()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    if not frames:
+        raise RuntimeError(
+            "AV1 decode produced no frames: "
+            f"{(err or b'').decode('utf-8', 'ignore').strip()[-300:]}")
+    if n_target and n_target > 0:  # pick EXACTLY n_target, evenly across the window
+        m = len(frames)
+        idx = [min(m - 1, int((i + 0.5) * m / n_target)) for i in range(n_target)]
+        frames = [frames[j] for j in idx]
+    return frames
 
 
 # ───────────────────────── node ─────────────────────────
@@ -451,23 +487,11 @@ class FloyoVideoStudio:
                 f"(import error: {_AV_ERR})")
 
         path = _safe_input_path(video)
-        # AV1 fallback (independent — uses imageio-ffmpeg's bundled dav1d ffmpeg; PyAV and
-        # every other dependency stay untouched). The backend can't decode AV1, so transcode
-        # JUST the trim window to a temp H.264 and run everything below on that (0-based).
-        # H.264/other clips skip this entirely and stay exactly as fast as before.
-        _av1_tmp = None
-        if _is_av1(path):
-            _om = _probe(path)
-            _dur = _om.get("duration") or 0.0
-            _s = max(0.0, float(start_seconds))
-            _e = float(end_seconds)
-            if _e <= 0 or (_dur and _e > _dur):
-                _e = _dur or (_s + 10.0)
-            if _e <= _s:
-                _e = _dur if (_dur and _dur > _s) else (_s + 1.0)
-            path = _transcode_av1_window(path, _s, _e)
-            _av1_tmp = path
-            start_seconds, end_seconds = 0.0, max(1e-3, _e - _s)
+        # AV1 needs the independent dav1d path (the backend's PyAV/decord can't decode AV1).
+        # The header still reads fine, so metadata/trim resolve normally below; only the
+        # frame decode branches to imageio-ffmpeg. H.264/other clips set _av1=False and run
+        # exactly as before. No temp transcode → AV1 is now as fast as H.264.
+        _av1 = _is_av1(path)
         meta = _probe(path)
         src_fps = meta["fps"] or 30.0
         src_w, src_h = meta["width"], meta["height"]
@@ -510,13 +534,18 @@ class FloyoVideoStudio:
         #    vs the window; PyAV handles all-frames / dense / fallback. ──
         do_downscale = bool(preset_h and src_h and src_h > preset_h)
         decord_batch = None
-        if n_target > 0 and _HAS_DECORD:
+        frames = []
+        if _av1:
+            # FAST AV1: decode the trim window straight to scaled RGB frames via
+            # imageio-ffmpeg's bundled dav1d ffmpeg — no slow H.264 re-encode. PyAV and
+            # decord can't decode AV1, so both are skipped for these clips.
+            frames = _decode_av1_frames(path, start, end, tw, th, out_fps, n_target)
+        elif n_target > 0 and _HAS_DECORD:
             window_frames = max(1, int(round(out_dur * src_fps)))
             if n_target <= int(window_frames * 0.7) + 2:
                 decord_batch = _decord_exact_frames(path, start, end, n_target, tw, th, do_downscale)
 
-        frames = []
-        if decord_batch is None:
+        if (not _av1) and decord_batch is None:
             try:
                 with av.open(path) as c:
                     v = c.streams.video[0]
@@ -596,11 +625,6 @@ class FloyoVideoStudio:
 
         audio = _extract_audio(path, start, end) if include_audio else _silent_audio()
         frame_count = int(images.shape[0])
-        if _av1_tmp:  # the AV1 temp is no longer needed (frames + audio are in memory)
-            try:
-                os.remove(_av1_tmp)
-            except Exception:
-                pass
 
         # Assemble the headline `video` output: the exact frames we kept (trim +
         # downscale baked in) at the output fps, with the trimmed audio muxed in. This
