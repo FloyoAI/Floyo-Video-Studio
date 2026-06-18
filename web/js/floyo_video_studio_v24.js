@@ -58,15 +58,6 @@ function injectStyles() {
 .fvs-mode .fvs-on { color:#34d399; font-weight:600; }
 .fvs-mode .fvs-off { color:#f59e0b; }
 .fvs-meta { font-size:11px; color:#9ca3af; min-height:14px; }
-.fvs-scrub-overlay { position:absolute; left:8px; right:8px; bottom:42px; z-index:30; background:rgba(0,0,0,0.55); border-radius:8px; padding:1px 10px 3px; box-shadow:0 1px 6px rgba(0,0,0,0.45); }
-.fvs-scrub-overlay .fvs-scrub-time { color:#e5e7eb; text-align:left; }
-.fvs-scrub-time { font-size:10px; color:#9ca3af; margin-top:1px; font-variant-numeric:tabular-nums; }
-/* The native <video> seek bar gets captured by the LiteGraph canvas (can't drag to scrub),
-   so we hide it on OUR preview and drive playback from the range input below, which works. */
-video.fvs-noseek::-webkit-media-controls-timeline { display:none !important; }
-video.fvs-noseek::-webkit-media-controls-timeline-container { display:none !important; }
-video.fvs-noseek::-webkit-media-controls-current-time-display { display:none !important; }
-video.fvs-noseek::-webkit-media-controls-time-remaining-display { display:none !important; }
 `;
         const s = document.createElement("style");
         s.id = STYLE_ID;
@@ -76,10 +67,10 @@ video.fvs-noseek::-webkit-media-controls-time-remaining-display { display:none !
 }
 
 function fmtTime(s) {
-    s = Math.max(0, Number(s) || 0);
+    s = Math.max(0, Math.round(Number(s) || 0));
     const m = Math.floor(s / 60);
-    const sec = s - m * 60;
-    return `${String(m).padStart(2, "0")}:${sec.toFixed(1).padStart(4, "0")}`;
+    const sec = s % 60;
+    return `${m}:${String(sec).padStart(2, "0")}`;   // e.g. 4:31, like the native player
 }
 
 function getWidget(node, name) {
@@ -227,7 +218,7 @@ async function probeViaBrowser(url, cancelled) {
 // (seekable.end === 0; currentTime snaps back to 0). Fetch the whole clip into a blob —
 // blob: URLs ARE seekable — and swap the src so the scrub bar can actually move the video.
 // Capped so we never blow up memory on a huge clip; the small download is one-time.
-function makeSeekable(state, v) {
+function makeSeekable(v) {
     (async () => {
         try {
             if (!v || v.__floyoSeek) return;
@@ -237,7 +228,6 @@ function makeSeekable(state, v) {
             const url = v.currentSrc || v.src || "";
             if (!/^https?:/i.test(url)) { v.__floyoSeek = "skip"; return; }
             v.__floyoSeek = "loading";
-            if (state.sTime) state.sTime.textContent = "preparing scrub…";
             const r = await fetch(url);
             const len = +(r.headers.get("content-length") || 0);
             if (len && len > 800 * 1024 * 1024) { try { r.body.cancel(); } catch (_) {} v.__floyoSeek = "toobig"; return; }
@@ -253,47 +243,10 @@ function makeSeekable(state, v) {
     })();
 }
 
-// Move the scrub bar INTO the preview video (overlay it across the bottom), so it reads as
-// the video's own seek bar. Re-homes on each call so it follows the video if it re-renders.
-function overlayScrub(state, v) {
-    try {
-        const box = v && v.parentElement;
-        const slider = state.sRange && state.sRange.closest(".fvs-slider");
-        if (!box || !slider || !state.sTime) return;
-        let ov = state.scrubOverlay;
-        if (!ov) {
-            ov = document.createElement("div");
-            ov.className = "fvs-scrub-overlay";
-            ov.append(slider, state.sTime);
-            state.scrubOverlay = ov;
-            if (state.scrubHead) state.scrubHead.style.display = "none";
-        }
-        if (getComputedStyle(box).position === "static") box.style.position = "relative";
-        if (ov.parentElement !== box) box.appendChild(ov);
-    } catch (_) {}
-}
-
+// Just make the clip seekable; the video's OWN native seek bar does the scrubbing. No custom
+// bar/overlay — that only duplicated the native controls and cluttered the panel.
 function tagScrubVideo(state, v) {
-    try {
-        if (!v) return v;
-        state.scrubVideo = v;            // cache so onScrub doesn't DOM-walk per input
-        makeSeekable(state, v);
-        overlayScrub(state, v);
-        if (v.__floyoScrub) return v;
-        v.__floyoScrub = true;
-        const upd = () => {
-            if (!state.sRange || !(v.duration > 0)) return;
-            const f = Math.min(1, Math.max(0, v.currentTime / v.duration));
-            if (document.activeElement !== state.sRange) {
-                state.sRange.value = String(f);
-                if (state.sFill) state.sFill.style.width = (f * 100) + "%";
-            }
-            if (state.sTime) state.sTime.textContent = fmtTime(v.currentTime) + " / " + fmtTime(v.duration);
-        };
-        ["timeupdate", "loadedmetadata", "durationchange", "seeked"].forEach((ev) =>
-            v.addEventListener(ev, upd));
-        upd();
-    } catch (_) {}
+    if (v) makeSeekable(v);
     return v;
 }
 
@@ -539,51 +492,6 @@ function setup(node) {
         wrap.appendChild(meta);
         state.metaLabel = meta;
 
-        // ── Preview scrub — drives the preview video's currentTime. The native seek bar is
-        //    captured by the LiteGraph canvas (can't drag it), so we hide it and scrub from
-        //    this range input, which (like the trim handles) the canvas doesn't swallow. ──
-        const scrubHead = document.createElement("div"); scrubHead.className = "fvs-sec"; scrubHead.textContent = "Preview ▶ scrub";
-        wrap.appendChild(scrubHead);
-        const scrub = document.createElement("div"); scrub.className = "fvs-slider";
-        const sTrack = document.createElement("div"); sTrack.className = "fvs-track";
-        const sFill = document.createElement("div"); sFill.className = "fvs-fill"; sFill.style.left = "0%"; sFill.style.width = "0%";
-        const sRange = document.createElement("input"); sRange.type = "range"; sRange.className = "fvs-range";
-        sRange.min = "0"; sRange.max = "1"; sRange.step = "0.0001"; sRange.value = "0";
-        // The shared .fvs-range sets pointer-events:none on the track (needed only so the TWO
-        // overlapping trim handles don't block each other) — that left just the tiny 14px
-        // thumb grabbable, so this single scrub bar couldn't be dragged. Make the WHOLE bar
-        // interactive, and stop the drag from bubbling to the LiteGraph canvas (which would
-        // pan the node instead of seeking).
-        sRange.style.pointerEvents = "auto";
-        ["pointerdown", "pointermove", "pointerup", "mousedown", "mousemove", "mouseup", "touchstart", "touchmove", "touchend"]
-            .forEach((ev) => sRange.addEventListener(ev, (e) => e.stopPropagation(), { passive: true }));
-        scrub.append(sTrack, sFill, sRange);
-        wrap.appendChild(scrub);
-        const sTime = document.createElement("div"); sTime.className = "fvs-scrub-time"; sTime.textContent = "00:00.0 / 00:00.0";
-        wrap.appendChild(sTime);
-        state.sRange = sRange; state.sFill = sFill; state.sTime = sTime; state.scrubHead = scrubHead;
-
-        // Smooth scrubbing: update the fill INSTANTLY on every input (cheap), but throttle the
-        // actual video seek to one per animation frame and use fastSeek (nearest keyframe) so
-        // the decoder keeps up. Reuse the cached video — no DOM walk per input.
-        let scrubRaf = 0, scrubFrac = 0;
-        const applyScrub = (precise) => {
-            let v = state.scrubVideo;
-            if (!v || !v.isConnected) v = frontendVideo(state);
-            if (!v || !(v.duration > 0)) return;
-            const t = scrubFrac * v.duration;
-            try { if (!precise && typeof v.fastSeek === "function") v.fastSeek(t); else v.currentTime = t; }
-            catch (_) { try { v.currentTime = t; } catch (_) {} }
-            sTime.textContent = fmtTime(t) + " / " + fmtTime(v.duration);
-        };
-        const onScrub = () => {
-            scrubFrac = parseFloat(sRange.value) || 0;
-            sFill.style.width = (scrubFrac * 100) + "%";
-            if (!scrubRaf) scrubRaf = requestAnimationFrame(() => { scrubRaf = 0; applyScrub(false); });
-        };
-        sRange.addEventListener("input", onScrub);
-        sRange.addEventListener("change", () => applyScrub(true));
-
         const onSlide = () => {
             const dur = state.meta.duration || 1;
             let lo = parseFloat(rMin.value) * dur;
@@ -669,7 +577,7 @@ async function loadMeta(state, value) {
         state.meta.width = v.videoWidth || 0;
         state.meta.height = v.videoHeight || 0;
         state.endW.value = Math.round(v.duration * 100) / 100;
-        state.metaLabel.textContent = `${state.meta.width || "?"}×${state.meta.height || "?"} · ${fmtTime(v.duration)}`;
+        state.metaLabel.textContent = `Length ${fmtTime(v.duration)}`;
         syncFromWidgets(state);
     }
 
@@ -734,7 +642,7 @@ async function loadMeta(state, value) {
     if (fpsPending) attachPassiveFps(state, v);
     if (state.meta.width || state.meta.duration) {
         const aud = state.meta.has_audio === undefined ? "" : (state.meta.has_audio ? " · 🔊 audio" : " · no audio");
-        state.metaLabel.textContent = `${state.meta.width || "?"}×${state.meta.height || "?"} · ${fmtTime(state.meta.duration)}${aud}`;
+        state.metaLabel.textContent = `Length ${fmtTime(state.meta.duration)}${aud}`;
     } else {
         state.metaLabel.textContent = "Could not read video info (the trim still works by seconds).";
     }
@@ -791,7 +699,7 @@ function refresh(state) {
             `Start <b>${fmtTime(lo)}</b> <span class="fvs-frames">(frame ${fLo})</span> → ` +
             `End <b>${fmtTime(hi)}</b> <span class="fvs-frames">(frame ${fHi})</span>` +
             `<div class="fvs-out">Output: <span class="fvs-frames">${nFrames} frames</span> · ` +
-            `<b>${efps || "—"} fps</b> · ${(hi - lo).toFixed(1)}s</div>` +
+            `<b>${efps || "—"} fps</b> · ${fmtTime(hi - lo)}</div>` +
             `<div class="fvs-mode">${modeHtml}</div>`;
         state.node?.setDirtyCanvas?.(true, true);
     } catch (_) {}
