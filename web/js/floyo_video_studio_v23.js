@@ -65,6 +65,8 @@ function injectStyles() {
    so we hide it on OUR preview and drive playback from the range input below, which works. */
 video.fvs-noseek::-webkit-media-controls-timeline { display:none !important; }
 video.fvs-noseek::-webkit-media-controls-timeline-container { display:none !important; }
+video.fvs-noseek::-webkit-media-controls-current-time-display { display:none !important; }
+video.fvs-noseek::-webkit-media-controls-time-remaining-display { display:none !important; }
 `;
         const s = document.createElement("style");
         s.id = STYLE_ID;
