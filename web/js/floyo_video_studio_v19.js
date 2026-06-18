@@ -82,6 +82,18 @@ function getWidget(node, name) {
     return (node.widgets || []).find((w) => w.name === name);
 }
 
+// A fresh upload (from EITHER the folder-icon combo or our Choose/upload button) sets the
+// `video` combo's VALUE but doesn't add it to the option list, so a run fails validation
+// with "Value not in list". Register the current value as a valid option so both upload
+// paths behave the same and the graph runs.
+function ensureVideoOption(node) {
+    try {
+        const vw = getWidget(node, "video");
+        if (!vw || !vw.options || !Array.isArray(vw.options.values)) return;
+        if (vw.value && !vw.options.values.includes(vw.value)) vw.options.values.push(vw.value);
+    } catch (_) {}
+}
+
 // The platform's video_upload widget renders its own <video> preview as a DOM
 // sibling of our wrap. Find it (walk up to the common container, then down) so we can
 // read its metadata AND scrub it when the trim handles move. Fallback: if there's
@@ -533,9 +545,19 @@ function setup(node) {
 
         node.addDOMWidget("fvs_ui", "floyo_video_studio", wrap, { serialize: false });
 
-        [120, 600, 1500].forEach((d) => setTimeout(() => {
-            if (videoW.value && videoW.value !== state._loaded) loadMeta(state, videoW.value);
-        }, d));
+        // Watch the video widget for a value change from ANY path — the folder-icon combo,
+        // our Choose/upload button, drag-drop, or a restored workflow — and register the
+        // value as a valid option + (re)load its metadata. Keeps both upload routes in sync.
+        const watchVideo = () => {
+            try {
+                ensureVideoOption(node);
+                if (videoW.value && videoW.value !== state._loaded) loadMeta(state, videoW.value);
+            } catch (_) {}
+        };
+        [120, 600, 1500].forEach((d) => setTimeout(watchVideo, d));
+        state._videoWatch = setInterval(watchVideo, 700);
+        const _origRemoved = node.onRemoved;
+        node.onRemoved = function () { try { clearInterval(state._videoWatch); } catch (_) {} return _origRemoved ? _origRemoved.apply(this, arguments) : undefined; };
 
         if (!node.size || node.size[0] < 300) node.setSize?.([320, node.size ? node.size[1] : 380]);
         refresh(state);
@@ -552,6 +574,7 @@ function setup(node) {
 // numbers.
 async function loadMeta(state, value) {
     if (!value) return;
+    ensureVideoOption(state.node);             // a freshly-uploaded value must be a valid option
     const token = ++state._loadToken;          // guards against an older load finishing late
     state._loaded = value;
     state.meta = { duration: 0, fps: 0, frame_count: 0, width: 0, height: 0, has_audio: undefined };
