@@ -507,6 +507,12 @@ class FloyoVideoStudio:
                             if len(frames) >= _ALL_FRAMES_SAFETY_CAP:
                                 break  # internal guard so a huge clip can't OOM
             except Exception as e:
+                m = str(e).lower()
+                if "av1" in m or "send_packet" in m or "get current frame" in m:
+                    raise RuntimeError(
+                        "This video is AV1-encoded, which this backend can't decode. "
+                        "Please re-upload it as H.264/MP4 (.mp4) — most editors/exporters "
+                        "use H.264 by default.")
                 raise RuntimeError(f"Could not decode the selected range: {e}")
             if not frames:
                 raise RuntimeError("No frames found in the selected time range — widen start/end.")
