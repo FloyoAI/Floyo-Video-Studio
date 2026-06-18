@@ -383,6 +383,17 @@ class FloyoVideoStudio:
     CATEGORY = "Floyo/Video"
 
     @classmethod
+    def VALIDATE_INPUTS(cls, video):
+        # Platform uploads are on-demand "#inputs/…" / "#community_inputs/…" references that
+        # are NOT in the static combo list yet (a download-manager fetches the file at run
+        # time), so ComfyUI's default "Value not in list" check rejects valid uploads. Accept
+        # any non-empty selection here; _safe_input_path is the real guard when the node runs.
+        # Listing `video` in this signature makes ComfyUI skip its default combo-list check.
+        if isinstance(video, str) and video.strip():
+            return True
+        return "No video selected."
+
+    @classmethod
     def IS_CHANGED(cls, video, start_seconds, end_seconds, quality, target_fps, target_frames, include_audio):
         try:
             path = _safe_input_path(video)
