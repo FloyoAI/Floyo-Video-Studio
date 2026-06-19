@@ -763,15 +763,13 @@ function fvsClearAll() {
 }
 if (!window.__fvsProgressHooked) {
     window.__fvsProgressHooked = true;
-    let execId = null;
-    api.addEventListener("executing", (e) => {
-        const d = e?.detail;
-        execId = (d && typeof d === "object") ? (d.node ?? null) : (d ?? null);
-    });
-    api.addEventListener("progress", (e) => {
+    // Driven ONLY by our backend's custom `floyo_vs_progress` event (value already 0-100),
+    // so we don't use ComfyUI's built-in `progress` event — which is what drew the second,
+    // redundant bar across the top of the node. Just one bar now: our in-panel one.
+    api.addEventListener("floyo_vs_progress", (e) => {
         const d = e?.detail || {};
-        const node = fvsNodeById(d.node ?? execId);
-        if (node && node.__fvs && d.max) fvsSetStatus(node.__fvs, (d.value / d.max) * 100);
+        const node = fvsNodeById(d.node);
+        if (node && node.__fvs && typeof d.value === "number") fvsSetStatus(node.__fvs, d.value);
     });
     api.addEventListener("executed", (e) => {
         const node = fvsNodeById(e?.detail?.node);

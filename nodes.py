@@ -424,12 +424,35 @@ def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target):
 
 
 # ───────────────────────── progress + fast encode ─────────────────────────
+class _Progress:
+    """Pushes trim progress (0-100) to OUR own panel bar via a custom websocket event —
+    NOT ComfyUI's built-in ProgressBar (that also draws a second, redundant bar across the
+    top of the node). The frontend listens for `floyo_vs_progress` and updates the
+    in-panel "Trimming… N%" bar only. Best-effort; never raises into the decode."""
+    def __init__(self, unique_id):
+        self.uid = None if unique_id is None else str(unique_id)
+        self._last = -1
+
+    def send(self, pct):
+        if self.uid is None:
+            return
+        p = max(0, min(100, int(pct)))
+        if p == self._last:
+            return
+        self._last = p
+        try:
+            from server import PromptServer
+            PromptServer.instance.send_sync("floyo_vs_progress", {"node": self.uid, "value": p})
+        except Exception:
+            pass
+
+
 def _set_progress(pbar, pct):
-    """Drive the node's ComfyUI progress bar (0-100). Best-effort — never raises."""
+    """Best-effort progress update — never raises."""
     if pbar is None:
         return
     try:
-        pbar.update_absolute(max(0, min(100, int(pct))), 100)
+        pbar.send(pct)
     except Exception:
         pass
 
@@ -596,7 +619,10 @@ class FloyoVideoStudio:
                 "target_frames": ("INT", {"default": 0, "min": 0, "max": 100000,
                                           "tooltip": "Output EXACTLY this many frames, evenly sampled across the trim — for models that need a specific count (e.g. 81). Overrides fps. 0 = all frames."}),
                 "include_audio": ("BOOLEAN", {"default": True, "tooltip": "Also output the trimmed audio."}),
-            }
+            },
+            # The node id — so we can push trim progress to OUR own panel bar (a custom
+            # websocket event) instead of ComfyUI's built-in node progress overlay.
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("VIDEO", "IMAGE", "AUDIO", "FLOAT", "INT")
@@ -631,7 +657,7 @@ class FloyoVideoStudio:
         except Exception:
             return float("nan")
 
-    def process(self, video, start_seconds, end_seconds, quality, target_fps, target_frames, include_audio):
+    def process(self, video, start_seconds, end_seconds, quality, target_fps, target_frames, include_audio, unique_id=None):
         if not _HAS_AV:
             raise RuntimeError(
                 "Floyo Video Studio needs PyAV. Install it on the server: pip install av  "
@@ -683,13 +709,11 @@ class FloyoVideoStudio:
         #    index, so an exact extraction stays quick even on a long video, and the
         #    frames are the real ones (no resampling). Used when the count is sparse
         #    vs the window; PyAV handles all-frames / dense / fallback. ──
-        # Live progress so the user can SEE the trim working (no "is it stuck?"). One
-        # bar: ~0-40% during decode, 40-100% during the encode. Best-effort.
-        try:
-            from comfy.utils import ProgressBar
-            pbar = ProgressBar(100)
-        except Exception:
-            pbar = None
+        # Live progress so the user can SEE the trim working (no "is it stuck?"). Pushed to
+        # OUR in-panel "Trimming… N%" bar via a custom event (NOT ComfyUI's ProgressBar,
+        # which would draw a second redundant bar across the node top). ~0-40% decode,
+        # 40-100% encode. Best-effort.
+        pbar = _Progress(unique_id)
         _set_progress(pbar, 2)
         est_n = n_target if n_target > 0 else max(1, int(round(out_dur * out_fps)))
 
