@@ -58,6 +58,12 @@ function injectStyles() {
 .fvs-mode .fvs-on { color:#34d399; font-weight:600; }
 .fvs-mode .fvs-off { color:#f59e0b; }
 .fvs-meta { font-size:11px; color:#9ca3af; min-height:14px; }
+.fvs-status { margin-top:9px; display:none; }
+.fvs-status-track { height:8px; border-radius:6px; background:rgba(255,255,255,0.08); overflow:hidden; }
+.fvs-status-fill { height:100%; width:0%; border-radius:6px; background:linear-gradient(90deg,#7C3AED,#60A5FA); transition:width .18s ease; }
+.fvs-status-text { font-size:11px; color:#cbd5e1; margin-top:5px; font-weight:600; letter-spacing:.2px; }
+.fvs-status.is-done .fvs-status-fill { background:#22c55e; }
+.fvs-status.is-done .fvs-status-text { color:#22c55e; }
 `;
         const s = document.createElement("style");
         s.id = STYLE_ID;
@@ -67,14 +73,26 @@ function injectStyles() {
 }
 
 function fmtTime(s) {
-    s = Math.max(0, Number(s) || 0);
+    s = Math.max(0, Math.round(Number(s) || 0));
     const m = Math.floor(s / 60);
-    const sec = s - m * 60;
-    return `${String(m).padStart(2, "0")}:${sec.toFixed(1).padStart(4, "0")}`;
+    const sec = s % 60;
+    return `${m}:${String(sec).padStart(2, "0")}`;   // e.g. 4:31, like the native player
 }
 
 function getWidget(node, name) {
     return (node.widgets || []).find((w) => w.name === name);
+}
+
+// A fresh upload (from EITHER the folder-icon combo or our Choose/upload button) sets the
+// `video` combo's VALUE but doesn't add it to the option list, so a run fails validation
+// with "Value not in list". Register the current value as a valid option so both upload
+// paths behave the same and the graph runs.
+function ensureVideoOption(node) {
+    try {
+        const vw = getWidget(node, "video");
+        if (!vw || !vw.options || !Array.isArray(vw.options.values)) return;
+        if (vw.value && !vw.options.values.includes(vw.value)) vw.options.values.push(vw.value);
+    } catch (_) {}
 }
 
 // The platform's video_upload widget renders its own <video> preview as a DOM
@@ -99,16 +117,155 @@ function protectVideos(root) {
     try { (root || document).querySelectorAll("video").forEach(protectVideo); } catch (_) {}
 }
 
+// ── Browser-side MP4/MOV header parse (exact fps + frame_count for uploaded clips) ──
+// The platform's preview-video URLs are auth'd, so the BACKEND can't read them (401). But
+// the browser already loaded the clip, so we fetch the bytes here. The origin ignores Range
+// and 200s the whole file, so we STREAM and abort once the moov box is complete (uploads are
+// faststart → moov at the front → a few hundred KB, no decode, no GPU — fine on low-end).
+function _fvsConcat(chunks, total) {
+    const buf = new Uint8Array(total); let o = 0;
+    for (const c of chunks) { buf.set(c, o); o += c.length; }
+    return buf;
+}
+function _fvsMoovEnd(buf, total) {
+    // byte offset where the top-level moov box ends, or -1 if not yet present
+    const dv = new DataView(buf.buffer, buf.byteOffset, total);
+    let pos = 0;
+    while (pos + 16 <= total) {
+        let sz = dv.getUint32(pos);
+        const t = String.fromCharCode(dv.getUint8(pos + 4), dv.getUint8(pos + 5), dv.getUint8(pos + 6), dv.getUint8(pos + 7));
+        if (sz === 1) sz = dv.getUint32(pos + 8) * 4294967296 + dv.getUint32(pos + 12);
+        if (t === "moov") return pos + sz;
+        if (sz < 8) return -1;
+        pos += sz;
+    }
+    return -1;
+}
+function _fvsParseMoov(buf) {
+    try {
+        const total = buf.length;
+        const dv = new DataView(buf.buffer, buf.byteOffset, total);
+        const u32 = (p) => dv.getUint32(p);
+        const fourcc = (p) => String.fromCharCode(dv.getUint8(p), dv.getUint8(p + 1), dv.getUint8(p + 2), dv.getUint8(p + 3));
+        const boxtype = (p) => fourcc(p + 4); // box TYPE is at boxStart+4 (size is at +0)
+        let pos = 0, ms = -1, me = -1;
+        while (pos + 8 <= total) {
+            let sz = u32(pos); const t = boxtype(pos); let hl = 8;
+            if (sz === 1) { sz = u32(pos + 8) * 4294967296 + u32(pos + 12); hl = 16; }
+            if (t === "moov") { ms = pos + hl; me = Math.min(pos + sz, total); break; }
+            if (sz < 8) break; pos += sz;
+        }
+        if (ms < 0) return null;
+        const traks = [];
+        const walk = (s, e, f) => {
+            let p = s; f = f || {};
+            while (p + 8 <= e) {
+                let sz = u32(p); const t = boxtype(p); let hl = 8;
+                if (sz === 1) { sz = u32(p + 8) * 4294967296 + u32(p + 12); hl = 16; }
+                if (sz < 8 || p + sz > e) sz = e - p;
+                const cs = p + hl, ce = Math.min(p + sz, e);
+                if (t === "trak") { const tf = {}; walk(cs, ce, tf); traks.push(tf); }
+                else if (t === "mdia" || t === "minf" || t === "stbl") walk(cs, ce, f);
+                // QuickTime has 2 hdlr per trak (media 'vide'/'soun' in mdia, data 'alis' in
+                // minf) — keep the FIRST (the media handler, which comes first).
+                else if (t === "hdlr" && !f.handler) f.handler = fourcc(cs + 8);
+                else if (t === "mdhd" && !f.timescale) {
+                    const ver = dv.getUint8(cs);
+                    if (ver === 1) { f.timescale = u32(cs + 20); f.mdur = u32(cs + 24) * 4294967296 + u32(cs + 28); }
+                    else { f.timescale = u32(cs + 12); f.mdur = u32(cs + 16); }
+                }
+                else if (t === "stts") {
+                    const ec = u32(cs + 4); let tot = 0, best = { sc: 0, sd: 0 };
+                    for (let i = 0; i < ec && cs + 8 + i * 8 + 8 <= ce; i++) {
+                        const sc = u32(cs + 8 + i * 8), sd = u32(cs + 8 + i * 8 + 4);
+                        tot += sc; if (sc > best.sc) best = { sc, sd };
+                    }
+                    f.sttsTotal = tot; f.sttsDelta = best.sd;
+                }
+                else if (t === "stsz" && !f.sampleCount) f.sampleCount = u32(cs + 8);
+                p += sz;
+            }
+        };
+        walk(ms, me, null);
+        const vid = traks.find((t) => t.handler === "vide");
+        if (!vid || !vid.timescale) return null;
+        const fps = vid.sttsDelta > 0 ? Math.round((vid.timescale / vid.sttsDelta) * 1000) / 1000 : 0;
+        const frames = vid.sampleCount || vid.sttsTotal || 0;
+        const duration = (vid.mdur && vid.timescale) ? vid.mdur / vid.timescale : 0;
+        if (!fps && !frames) return null;
+        return { fps, frames, duration: Math.round(duration * 10000) / 10000 };
+    } catch (_) { return null; }
+}
+async function probeViaBrowser(url, cancelled) {
+    try {
+        const ctrl = new AbortController();
+        const r = await fetch(url, { signal: ctrl.signal });
+        if (!r.ok && r.status !== 206) { try { ctrl.abort(); } catch (_) {} return null; }
+        const reader = r.body.getReader();
+        const chunks = []; let total = 0, moovEnd = -1;
+        const CAP = 6 * 1024 * 1024; // safety: a faststart moov is well under this
+        while (total < CAP) {
+            if (cancelled && cancelled()) { try { ctrl.abort(); } catch (_) {} return null; }
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value); total += value.length;
+            if (moovEnd < 0) moovEnd = _fvsMoovEnd(_fvsConcat(chunks, total), total);
+            if (moovEnd > 0 && total >= moovEnd) break; // got the whole moov — stop downloading
+        }
+        try { ctrl.abort(); } catch (_) {}
+        return _fvsParseMoov(_fvsConcat(chunks, total));
+    } catch (_) { return null; }
+}
+
+// Hide the (canvas-captured) native seek bar on OUR preview video and mirror its playback
+// into our scrub range, so the user can scrub via a control LiteGraph doesn't swallow.
+// Scoped to our node's video (called from frontendVideo, which has state); attach once.
+// The platform serves preview videos WITHOUT working HTTP Range, so they aren't seekable
+// (seekable.end === 0; currentTime snaps back to 0). Fetch the whole clip into a blob —
+// blob: URLs ARE seekable — and swap the src so the scrub bar can actually move the video.
+// Capped so we never blow up memory on a huge clip; the small download is one-time.
+function makeSeekable(v) {
+    (async () => {
+        try {
+            if (!v || v.__floyoSeek) return;
+            v.__floyoSeek = "checking";
+            await new Promise((r) => setTimeout(r, 700));
+            if (v.seekable && v.seekable.length && v.seekable.end(0) > 0.5) { v.__floyoSeek = "native"; return; }
+            const url = v.currentSrc || v.src || "";
+            if (!/^https?:/i.test(url)) { v.__floyoSeek = "skip"; return; }
+            v.__floyoSeek = "loading";
+            const r = await fetch(url);
+            const len = +(r.headers.get("content-length") || 0);
+            if (len && len > 800 * 1024 * 1024) { try { r.body.cancel(); } catch (_) {} v.__floyoSeek = "toobig"; return; }
+            const blob = await r.blob();
+            if (v.__floyoSeek !== "loading" || !v.isConnected) return;
+            const t = v.currentTime, playing = !v.paused;
+            if (v.__floyoBlobUrl) { try { URL.revokeObjectURL(v.__floyoBlobUrl); } catch (_) {} }
+            v.__floyoBlobUrl = URL.createObjectURL(blob);
+            v.src = v.__floyoBlobUrl; v.load();
+            v.addEventListener("loadedmetadata", () => { try { v.currentTime = t; if (playing) v.play(); } catch (_) {} }, { once: true });
+            v.__floyoSeek = "seekable";
+        } catch (_) { if (v) v.__floyoSeek = "error"; }
+    })();
+}
+
+// Just make the clip seekable; the video's OWN native seek bar does the scrubbing. No custom
+// bar/overlay — that only duplicated the native controls and cluttered the panel.
+function tagScrubVideo(state, v) {
+    if (v) makeSeekable(v);
+    return v;
+}
+
 function frontendVideo(state) {
     try {
         let root = state.wrap;
         for (let i = 0; i < 14 && root; i++) {
             const v = root.querySelector && root.querySelector("video");
-            if (v) return protectVideo(v);
+            if (v) return tagScrubVideo(state, protectVideo(v));
             root = root.parentElement;
         }
         const all = document.querySelectorAll("video");
-        if (all.length === 1) return protectVideo(all[0]);
+        if (all.length === 1) return tagScrubVideo(state, protectVideo(all[0]));
     } catch (_) {}
     return null;
 }
@@ -341,6 +498,18 @@ function setup(node) {
         wrap.appendChild(meta);
         state.metaLabel = meta;
 
+        // ── Live trim/encode progress — so the user can SEE the node working while a
+        //    big clip is processed (driven by the backend ProgressBar; no "is it stuck?").
+        const statusBar = document.createElement("div");
+        statusBar.className = "fvs-status";
+        const sTrack = document.createElement("div"); sTrack.className = "fvs-status-track";
+        const sFill = document.createElement("div"); sFill.className = "fvs-status-fill";
+        sTrack.appendChild(sFill);
+        const sText = document.createElement("div"); sText.className = "fvs-status-text";
+        statusBar.append(sTrack, sText);
+        wrap.appendChild(statusBar);
+        state.statusBar = statusBar; state.statusFill = sFill; state.statusText = sText;
+
         const onSlide = () => {
             const dur = state.meta.duration || 1;
             let lo = parseFloat(rMin.value) * dur;
@@ -377,9 +546,19 @@ function setup(node) {
 
         node.addDOMWidget("fvs_ui", "floyo_video_studio", wrap, { serialize: false });
 
-        [120, 600, 1500].forEach((d) => setTimeout(() => {
-            if (videoW.value && videoW.value !== state._loaded) loadMeta(state, videoW.value);
-        }, d));
+        // Watch the video widget for a value change from ANY path — the folder-icon combo,
+        // our Choose/upload button, drag-drop, or a restored workflow — and register the
+        // value as a valid option + (re)load its metadata. Keeps both upload routes in sync.
+        const watchVideo = () => {
+            try {
+                ensureVideoOption(node);
+                if (videoW.value && videoW.value !== state._loaded) loadMeta(state, videoW.value);
+            } catch (_) {}
+        };
+        [120, 600, 1500].forEach((d) => setTimeout(watchVideo, d));
+        state._videoWatch = setInterval(watchVideo, 700);
+        const _origRemoved = node.onRemoved;
+        node.onRemoved = function () { try { clearInterval(state._videoWatch); } catch (_) {} return _origRemoved ? _origRemoved.apply(this, arguments) : undefined; };
 
         if (!node.size || node.size[0] < 300) node.setSize?.([320, node.size ? node.size[1] : 380]);
         refresh(state);
@@ -396,6 +575,7 @@ function setup(node) {
 // numbers.
 async function loadMeta(state, value) {
     if (!value) return;
+    ensureVideoOption(state.node);             // a freshly-uploaded value must be a valid option
     const token = ++state._loadToken;          // guards against an older load finishing late
     state._loaded = value;
     state.meta = { duration: 0, fps: 0, frame_count: 0, width: 0, height: 0, has_audio: undefined };
@@ -415,7 +595,7 @@ async function loadMeta(state, value) {
         state.meta.width = v.videoWidth || 0;
         state.meta.height = v.videoHeight || 0;
         state.endW.value = Math.round(v.duration * 100) / 100;
-        state.metaLabel.textContent = `${state.meta.width || "?"}×${state.meta.height || "?"} · ${fmtTime(v.duration)}`;
+        state.metaLabel.textContent = `Length ${fmtTime(v.duration)}`;
         syncFromWidgets(state);
     }
 
@@ -434,29 +614,21 @@ async function loadMeta(state, value) {
         }
     } catch (_) {}
 
-    // 2b) probe still blank → a just-uploaded #inputs file isn't on the backend disk yet.
-    // Ask the backend to read the header straight from the preview video's URL: ffmpeg
-    // range-fetches ONLY the moov/header (no full download, no decode), so it resolves fast
-    // and light for ANY length — 20-30 min 4K included — and runs server-side, so a
-    // low-end device does zero work. This is the primary path for uploaded clips.
+    // 2b) probe still blank → a just-uploaded #inputs file isn't on the backend disk yet,
+    // and the platform's preview-video URL is AUTH'd (the backend gets 401 fetching it).
+    // The browser already loaded the clip, so parse its MP4/MOV header HERE: stream only the
+    // moov (uploads are faststart) and read EXACT fps + frame_count — a few hundred KB, no
+    // decode, no GPU. Works for any length (20-30 min 4K) on low-end devices.
     if (!fps && v) {
         const url = v.currentSrc || v.src || "";
-        if (/^https:\/\//i.test(url)) {
+        if (/^(https?:|blob:)/i.test(url)) {
             try {
-                // GET (the platform proxy forwards GET custom routes, not POST). Abort after
-                // 10s so a slow/hung origin can never freeze the panel — we just fall through.
-                const ctrl = new AbortController();
-                const to = setTimeout(() => ctrl.abort(), 10000);
-                const r = await api.fetchApi("/floyo_vs/probe_url?url=" + encodeURIComponent(url), { signal: ctrl.signal });
-                clearTimeout(to);
-                const m = await r.json();
+                const m = await probeViaBrowser(url, () => token !== state._loadToken);
                 if (token !== state._loadToken) return;
-                if (r.ok && !m.error) {
+                if (m) {
                     fps = Number(m.fps) || fps;
-                    frames = Number(m.frame_count) || frames;
-                    if (state.meta.has_audio === undefined) state.meta.has_audio = m.has_audio;
+                    frames = Number(m.frames) || frames;
                     if (!state.meta.duration && m.duration) state.meta.duration = m.duration;
-                    if (!state.meta.width && m.width) { state.meta.width = m.width; state.meta.height = m.height; }
                 }
             } catch (_) {}
         }
@@ -488,7 +660,7 @@ async function loadMeta(state, value) {
     if (fpsPending) attachPassiveFps(state, v);
     if (state.meta.width || state.meta.duration) {
         const aud = state.meta.has_audio === undefined ? "" : (state.meta.has_audio ? " · 🔊 audio" : " · no audio");
-        state.metaLabel.textContent = `${state.meta.width || "?"}×${state.meta.height || "?"} · ${fmtTime(state.meta.duration)}${aud}`;
+        state.metaLabel.textContent = `Length ${fmtTime(state.meta.duration)}${aud}`;
     } else {
         state.metaLabel.textContent = "Could not read video info (the trim still works by seconds).";
     }
@@ -545,7 +717,7 @@ function refresh(state) {
             `Start <b>${fmtTime(lo)}</b> <span class="fvs-frames">(frame ${fLo})</span> → ` +
             `End <b>${fmtTime(hi)}</b> <span class="fvs-frames">(frame ${fHi})</span>` +
             `<div class="fvs-out">Output: <span class="fvs-frames">${nFrames} frames</span> · ` +
-            `<b>${efps || "—"} fps</b> · ${(hi - lo).toFixed(1)}s</div>` +
+            `<b>${efps || "—"} fps</b> · ${fmtTime(hi - lo)}</div>` +
             `<div class="fvs-mode">${modeHtml}</div>`;
         state.node?.setDirtyCanvas?.(true, true);
     } catch (_) {}
@@ -567,3 +739,44 @@ app.registerExtension({
         };
     },
 });
+
+// ── Mirror the node's backend ProgressBar into the panel (hooked ONCE) so the user
+//    sees the trim/encode advancing instead of wondering if the node is stuck. ──
+function fvsNodeById(id) {
+    if (id == null) return null;
+    try { return app.graph.getNodeById(Number(id)) || (app.graph._nodes_by_id || {})[id] || null; } catch (_) { return null; }
+}
+function fvsSetStatus(state, pct) {
+    if (!state || !state.statusBar) return;
+    const p = Math.max(0, Math.min(100, Math.round(pct)));
+    const done = p >= 100;
+    state.statusBar.style.display = "block";
+    state.statusBar.classList.toggle("is-done", done);
+    if (state.statusFill) state.statusFill.style.width = p + "%";
+    if (state.statusText) state.statusText.textContent = done ? "✓ Done" : `⚙ Trimming… ${p}%`;
+    clearTimeout(state._statusHide);
+    if (done) state._statusHide = setTimeout(() => { try { state.statusBar.style.display = "none"; } catch (_) {} }, 1600);
+    try { state.node.setDirtyCanvas?.(true, true); } catch (_) {}
+}
+function fvsClearAll() {
+    try { (app.graph?._nodes || []).forEach((n) => { if (n.__fvs && n.__fvs.statusBar) n.__fvs.statusBar.style.display = "none"; }); } catch (_) {}
+}
+if (!window.__fvsProgressHooked) {
+    window.__fvsProgressHooked = true;
+    let execId = null;
+    api.addEventListener("executing", (e) => {
+        const d = e?.detail;
+        execId = (d && typeof d === "object") ? (d.node ?? null) : (d ?? null);
+    });
+    api.addEventListener("progress", (e) => {
+        const d = e?.detail || {};
+        const node = fvsNodeById(d.node ?? execId);
+        if (node && node.__fvs && d.max) fvsSetStatus(node.__fvs, (d.value / d.max) * 100);
+    });
+    api.addEventListener("executed", (e) => {
+        const node = fvsNodeById(e?.detail?.node);
+        if (node && node.__fvs) fvsSetStatus(node.__fvs, 100);
+    });
+    api.addEventListener("execution_error", fvsClearAll);
+    api.addEventListener("execution_interrupted", fvsClearAll);
+}
