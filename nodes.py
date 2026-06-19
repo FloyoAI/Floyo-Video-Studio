@@ -423,6 +423,157 @@ def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target):
     return frames
 
 
+# ───────────────────────── progress + fast encode ─────────────────────────
+def _set_progress(pbar, pct):
+    """Drive the node's ComfyUI progress bar (0-100). Best-effort — never raises."""
+    if pbar is None:
+        return
+    try:
+        pbar.update_absolute(max(0, min(100, int(pct))), 100)
+    except Exception:
+        pass
+
+
+_ENC_CACHE = {}
+
+
+def _pick_h264_encoder(ffmpeg_exe):
+    """Fastest available H.264 encoder for this ffmpeg. Prefers GPU **NVENC** (uses the
+    pod's GPU — near real-time, what we want for big clips) and falls back to a fast,
+    fully-threaded libx264. Probed once per binary and cached. If a CUDA/NVENC-enabled
+    ffmpeg is ever added to the pod, this lights up automatically with no code change."""
+    if ffmpeg_exe in _ENC_CACHE:
+        return _ENC_CACHE[ffmpeg_exe]
+    enc = ("libx264", ["-preset", "ultrafast", "-threads", "0", "-crf", "20"])
+    try:
+        import subprocess
+        out = subprocess.run([ffmpeg_exe, "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, timeout=15).stdout
+        if "h264_nvenc" in out:
+            # GPU path: p1 = fastest preset, ll = low-latency, vbr w/ a sane quality.
+            enc = ("h264_nvenc", ["-preset", "p1", "-tune", "ll", "-rc", "vbr", "-cq", "23", "-b:v", "0"])
+    except Exception:
+        pass
+    _ENC_CACHE[ffmpeg_exe] = enc
+    return enc
+
+
+def _write_temp_wav(audio, tdir):
+    """Write an AUDIO dict ({waveform:(1,C,T) float, sample_rate}) to a temp .wav so the
+    encoder can mux it. Returns the path or None. Dependency-free (stdlib wave)."""
+    try:
+        import uuid as _uuid
+        import wave
+        wav = audio.get("waveform") if isinstance(audio, dict) else None
+        if wav is None:
+            return None
+        a = wav
+        if hasattr(a, "dim"):
+            if a.dim() == 3:
+                a = a[0]
+            a = a.detach().cpu().numpy()
+        a = np.asarray(a, dtype=np.float32)
+        if a.ndim == 1:
+            a = a[None, :]
+        ch = int(a.shape[0])
+        if ch > 2:
+            a = a[:2]
+            ch = 2
+        if a.shape[1] <= 1:  # 1-sample silent placeholder → not worth muxing
+            return None
+        sr = int(audio.get("sample_rate") or 44100)
+        x = np.clip(a.T, -1.0, 1.0)  # (T, C)
+        x = (x * 32767.0).astype("<i2")
+        p = os.path.join(tdir, f"fvs_aud_{_uuid.uuid4().hex}.wav")
+        with wave.open(p, "wb") as wf:
+            wf.setnchannels(ch)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(np.ascontiguousarray(x).tobytes())
+        return p
+    except Exception:
+        return None
+
+
+def _encode_video_file(images, out_fps, audio, has_audio, pbar=None, lo=40, hi=99):
+    """Encode the kept frames to a real temp .mp4 by PIPING raw rgb24 straight into ONE
+    ffmpeg process (imageio-ffmpeg's bundled ffmpeg, independent of PyAV). This is far
+    faster than PyAV's per-frame Python encode loop — no per-frame swscale in Python,
+    ffmpeg threads the encode internally — so even a 4K window finishes in seconds
+    instead of minutes. Uses GPU NVENC when the ffmpeg exposes it, else fast libx264.
+    Reports progress (lo→hi). Returns the temp path (a FILE-BACKED video, which partner
+    uploader nodes require) or None on any failure (caller falls back)."""
+    import subprocess
+    import threading
+    import uuid as _uuid
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+    if images is None or int(images.shape[0]) == 0:
+        return None
+    n = int(images.shape[0])
+    h = int(images.shape[1])
+    w = int(images.shape[2])
+    tdir = folder_paths.get_temp_directory()
+    try:
+        os.makedirs(tdir, exist_ok=True)
+    except Exception:
+        pass
+    tpath = os.path.join(tdir, f"floyo_vs_{_uuid.uuid4().hex}.mp4")
+    wav_path = _write_temp_wav(audio, tdir) if has_audio else None
+    codec, copts = _pick_h264_encoder(ffmpeg)
+    cmd = [ffmpeg, "-y", "-v", "error", "-nostdin",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+           "-r", f"{max(1e-3, float(out_fps)):.6f}", "-i", "pipe:0"]
+    if wav_path:
+        cmd += ["-i", wav_path]
+    cmd += ["-c:v", codec, *copts, "-pix_fmt", "yuv420p"]
+    if wav_path:
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+    cmd += ["-movflags", "+faststart", tpath]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    err_box = {}
+
+    def _drain():
+        try:
+            err_box["e"] = proc.stderr.read()
+        except Exception:
+            pass
+
+    dt = threading.Thread(target=_drain, daemon=True)
+    dt.start()
+    is_u8 = images.dtype == torch.uint8
+    try:
+        for i in range(n):
+            fr = images[i]
+            if not is_u8:
+                fr = (fr.clamp(0, 1) * 255.0 + 0.5).to(torch.uint8)
+            proc.stdin.write(np.ascontiguousarray(fr.cpu().numpy()).tobytes())
+            if pbar is not None and (i % 8 == 0 or i == n - 1):
+                _set_progress(pbar, lo + (hi - lo) * (i + 1) / n)
+        proc.stdin.close()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        dt.join(timeout=2)
+        return None
+    proc.wait()
+    dt.join(timeout=5)
+    if wav_path:
+        try:
+            os.remove(wav_path)
+        except Exception:
+            pass
+    if proc.returncode != 0 or not os.path.exists(tpath) or os.path.getsize(tpath) == 0:
+        return None
+    return tpath
+
+
 # ───────────────────────── node ─────────────────────────
 class FloyoVideoStudio:
     @classmethod
@@ -532,6 +683,16 @@ class FloyoVideoStudio:
         #    index, so an exact extraction stays quick even on a long video, and the
         #    frames are the real ones (no resampling). Used when the count is sparse
         #    vs the window; PyAV handles all-frames / dense / fallback. ──
+        # Live progress so the user can SEE the trim working (no "is it stuck?"). One
+        # bar: ~0-40% during decode, 40-100% during the encode. Best-effort.
+        try:
+            from comfy.utils import ProgressBar
+            pbar = ProgressBar(100)
+        except Exception:
+            pbar = None
+        _set_progress(pbar, 2)
+        est_n = n_target if n_target > 0 else max(1, int(round(out_dur * out_fps)))
+
         do_downscale = bool(preset_h and src_h and src_h > preset_h)
         decord_batch = None
         frames = []
@@ -540,10 +701,13 @@ class FloyoVideoStudio:
             # imageio-ffmpeg's bundled dav1d ffmpeg — no slow H.264 re-encode. PyAV and
             # decord can't decode AV1, so both are skipped for these clips.
             frames = _decode_av1_frames(path, start, end, tw, th, out_fps, n_target)
+            _set_progress(pbar, 40)
         elif n_target > 0 and _HAS_DECORD:
             window_frames = max(1, int(round(out_dur * src_fps)))
             if n_target <= int(window_frames * 0.7) + 2:
                 decord_batch = _decord_exact_frames(path, start, end, n_target, tw, th, do_downscale)
+                if decord_batch is not None:
+                    _set_progress(pbar, 40)
 
         if (not _av1) and decord_batch is None:
             try:
@@ -571,6 +735,8 @@ class FloyoVideoStudio:
                                 frames.append(nd)
                                 last_nd = nd
                                 ti += 1
+                            if pbar is not None and (ti & 7) == 0:
+                                _set_progress(pbar, min(38, 2 + 38 * ti / est_n))
                             if t >= end:
                                 break
                         while ti < n_target and last_nd is not None:
@@ -593,6 +759,8 @@ class FloyoVideoStudio:
                             next_capture += step if step else 0.0
                             if next_capture < t:
                                 next_capture = t + step
+                            if pbar is not None and (len(frames) & 7) == 0:
+                                _set_progress(pbar, min(38, 2 + 38 * len(frames) / est_n))
                             if len(frames) >= _ALL_FRAMES_SAFETY_CAP:
                                 break  # internal guard so a huge clip can't OOM
             except Exception as e:
@@ -610,45 +778,53 @@ class FloyoVideoStudio:
         # the PyAV path fills a pre-allocated buffer with one in-place scale (frames
         # freed as we go → low peak memory on weak machines).
         if decord_batch is not None:
-            arr = decord_batch.astype(np.float32)
-            arr /= 255.0
-            images = torch.from_numpy(arr)
+            # torch's uint8→float cast is multithreaded — far quicker than numpy's
+            # single-threaded astype on a big 4K batch.
+            images = torch.from_numpy(np.ascontiguousarray(decord_batch)).to(torch.float32)
+            images.div_(255.0)
         else:
-            n = len(frames)
-            fh, fw = frames[0].shape[:2]
-            arr = np.empty((n, fh, fw, 3), dtype=np.float32)
-            for i in range(n):
-                arr[i] = frames[i]
-                frames[i] = None
-            arr /= 255.0
-            images = torch.from_numpy(arr)
+            # Stack once (one C-level copy) then convert with torch (multithreaded),
+            # instead of a Python per-frame float loop — that loop was ~64s for a 4K
+            # 300-frame batch; this is a few times faster and frees the uint8 source.
+            stacked = np.stack(frames)
+            frames = None
+            images = torch.from_numpy(stacked).to(torch.float32)
+            images.div_(255.0)
+            stacked = None
 
+        _set_progress(pbar, 40)
         audio = _extract_audio(path, start, end) if include_audio else _silent_audio()
         frame_count = int(images.shape[0])
+        has_real_audio = bool(include_audio and meta.get("has_audio"))
 
-        # Assemble the headline `video` output: the exact frames we kept (trim +
-        # downscale baked in) at the output fps, with the trimmed audio muxed in. This
-        # is a lazy container — nothing is encoded until a downstream node saves or
-        # uploads it — so it's free to hand out alongside the raw frames. A node that
-        # only wants frames simply ignores this port. Only attach real audio (skip the
-        # 1-sample silent placeholder) so a no-audio clip yields a clean silent video.
+        # Assemble the headline `video` output: the exact frames we kept (trim + downscale
+        # baked in) at the output fps, with the trimmed audio muxed in. FAST PATH: pipe the
+        # raw frames into one ffmpeg process (GPU NVENC if available, else fast libx264) —
+        # seconds even for 4K, vs minutes for PyAV's per-frame Python encode. Always a
+        # *file-backed* VIDEO: Floyo's partner AI nodes upload via get_stream_source() ->
+        # upload_file(path), which needs a real filesystem PATH (a bare in-memory video is
+        # rejected). Falls back to the PyAV/save_to path if the fast encode ever fails.
         video_out = None
-        if _HAS_VIDEO_API:
+        enc_path = None
+        try:
+            enc_path = _encode_video_file(images, out_fps, audio, has_real_audio,
+                                          pbar=pbar, lo=40, hi=99)
+        except Exception:
+            enc_path = None
+        if enc_path and _HAS_VIDEO_API:
             try:
-                vid_audio = audio if (include_audio and meta.get("has_audio")) else None
+                video_out = VideoFromFile(enc_path)
+            except Exception:
+                video_out = None
+        if video_out is None and _HAS_VIDEO_API:
+            try:
+                vid_audio = audio if has_real_audio else None
                 comps = VideoComponents(
                     images=images,
                     audio=vid_audio,
                     frame_rate=Fraction(out_fps).limit_denominator(1000000),
                 )
                 vc = VideoFromComponents(comps)
-                # Encode to a real temp .mp4 and hand back a *file-backed* VIDEO. Why:
-                # Floyo's partner AI nodes upload the clip via video.get_stream_source()
-                # -> upload_file(path), which needs a filesystem PATH. A bare
-                # VideoFromComponents only yields an in-memory BytesIO, which their
-                # uploader rejects ("expected str/bytes/os.PathLike, not BytesIO"). A
-                # VideoFromFile exposes a real path, so it works with the partner nodes
-                # AND stays fully compatible with Save Video / Video Combine.
                 try:
                     import uuid as _uuid
                     tdir = folder_paths.get_temp_directory()
@@ -657,9 +833,10 @@ class FloyoVideoStudio:
                     vc.save_to(tpath)
                     video_out = VideoFromFile(tpath)
                 except Exception:
-                    video_out = vc  # fall back to in-memory (still fine for Save Video)
+                    video_out = vc  # in-memory fallback (still fine for Save Video)
             except Exception:
                 video_out = None
+        _set_progress(pbar, 100)
 
         # video → for video-to-video AI / Save Video; frames → per-frame work; plus the
         # audio, the fps (Video Combine's frame_rate) and the count. The trim/quality

@@ -58,6 +58,12 @@ function injectStyles() {
 .fvs-mode .fvs-on { color:#34d399; font-weight:600; }
 .fvs-mode .fvs-off { color:#f59e0b; }
 .fvs-meta { font-size:11px; color:#9ca3af; min-height:14px; }
+.fvs-status { margin-top:9px; display:none; }
+.fvs-status-track { height:8px; border-radius:6px; background:rgba(255,255,255,0.08); overflow:hidden; }
+.fvs-status-fill { height:100%; width:0%; border-radius:6px; background:linear-gradient(90deg,#7C3AED,#60A5FA); transition:width .18s ease; }
+.fvs-status-text { font-size:11px; color:#cbd5e1; margin-top:5px; font-weight:600; letter-spacing:.2px; }
+.fvs-status.is-done .fvs-status-fill { background:#22c55e; }
+.fvs-status.is-done .fvs-status-text { color:#22c55e; }
 `;
         const s = document.createElement("style");
         s.id = STYLE_ID;
@@ -492,6 +498,18 @@ function setup(node) {
         wrap.appendChild(meta);
         state.metaLabel = meta;
 
+        // ── Live trim/encode progress — so the user can SEE the node working while a
+        //    big clip is processed (driven by the backend ProgressBar; no "is it stuck?").
+        const statusBar = document.createElement("div");
+        statusBar.className = "fvs-status";
+        const sTrack = document.createElement("div"); sTrack.className = "fvs-status-track";
+        const sFill = document.createElement("div"); sFill.className = "fvs-status-fill";
+        sTrack.appendChild(sFill);
+        const sText = document.createElement("div"); sText.className = "fvs-status-text";
+        statusBar.append(sTrack, sText);
+        wrap.appendChild(statusBar);
+        state.statusBar = statusBar; state.statusFill = sFill; state.statusText = sText;
+
         const onSlide = () => {
             const dur = state.meta.duration || 1;
             let lo = parseFloat(rMin.value) * dur;
@@ -721,3 +739,44 @@ app.registerExtension({
         };
     },
 });
+
+// ── Mirror the node's backend ProgressBar into the panel (hooked ONCE) so the user
+//    sees the trim/encode advancing instead of wondering if the node is stuck. ──
+function fvsNodeById(id) {
+    if (id == null) return null;
+    try { return app.graph.getNodeById(Number(id)) || (app.graph._nodes_by_id || {})[id] || null; } catch (_) { return null; }
+}
+function fvsSetStatus(state, pct) {
+    if (!state || !state.statusBar) return;
+    const p = Math.max(0, Math.min(100, Math.round(pct)));
+    const done = p >= 100;
+    state.statusBar.style.display = "block";
+    state.statusBar.classList.toggle("is-done", done);
+    if (state.statusFill) state.statusFill.style.width = p + "%";
+    if (state.statusText) state.statusText.textContent = done ? "✓ Done" : `⚙ Trimming… ${p}%`;
+    clearTimeout(state._statusHide);
+    if (done) state._statusHide = setTimeout(() => { try { state.statusBar.style.display = "none"; } catch (_) {} }, 1600);
+    try { state.node.setDirtyCanvas?.(true, true); } catch (_) {}
+}
+function fvsClearAll() {
+    try { (app.graph?._nodes || []).forEach((n) => { if (n.__fvs && n.__fvs.statusBar) n.__fvs.statusBar.style.display = "none"; }); } catch (_) {}
+}
+if (!window.__fvsProgressHooked) {
+    window.__fvsProgressHooked = true;
+    let execId = null;
+    api.addEventListener("executing", (e) => {
+        const d = e?.detail;
+        execId = (d && typeof d === "object") ? (d.node ?? null) : (d ?? null);
+    });
+    api.addEventListener("progress", (e) => {
+        const d = e?.detail || {};
+        const node = fvsNodeById(d.node ?? execId);
+        if (node && node.__fvs && d.max) fvsSetStatus(node.__fvs, (d.value / d.max) * 100);
+    });
+    api.addEventListener("executed", (e) => {
+        const node = fvsNodeById(e?.detail?.node);
+        if (node && node.__fvs) fvsSetStatus(node.__fvs, 100);
+    });
+    api.addEventListener("execution_error", fvsClearAll);
+    api.addEventListener("execution_interrupted", fvsClearAll);
+}
