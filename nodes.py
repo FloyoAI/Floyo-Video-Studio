@@ -874,6 +874,20 @@ try:
     from server import PromptServer
     from aiohttp import web
 
+    # Allow large video uploads from the NODE itself (no ComfyUI flag / run.sh change).
+    # Stock ComfyUI caps request bodies at --max-upload-size (default 100 MB) and rejects
+    # bigger files with HTTP 413 before the upload handler even runs. aiohttp reads
+    # app._client_max_size per request, so raising it here at load time lifts the cap with
+    # no restart and no ComfyUI config change. Bodies stream to disk → memory is unaffected.
+    # Only ever RAISE it (never lower a host that's already configured higher). Best-effort.
+    try:
+        _fvs_app = PromptServer.instance.app
+        _fvs_want = 4 * 1024 * 1024 * 1024  # 4 GB — comfortably covers 4K video uploads
+        if int(getattr(_fvs_app, "_client_max_size", 0) or 0) < _fvs_want:
+            _fvs_app._client_max_size = _fvs_want
+    except Exception:
+        pass
+
     @PromptServer.instance.routes.get("/floyo_vs/probe")
     async def _floyo_vs_probe(request):
         name = request.query.get("filename", "")
