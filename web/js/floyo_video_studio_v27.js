@@ -64,6 +64,9 @@ function injectStyles() {
 .fvs-status-text { font-size:11px; color:#cbd5e1; margin-top:5px; font-weight:600; letter-spacing:.2px; }
 .fvs-status.is-done .fvs-status-fill { background:#22c55e; }
 .fvs-status.is-done .fvs-status-text { color:#22c55e; }
+.fvs-brand { display:flex; justify-content:center; align-items:center; margin-top:12px; opacity:0.9; cursor:pointer; }
+.fvs-brand:hover { opacity:1; }
+.fvs-brand img { height:16px; width:auto; display:block; pointer-events:none; }
 `;
         const s = document.createElement("style");
         s.id = STYLE_ID;
@@ -398,6 +401,11 @@ function brandBadges(root) {
             e.stopPropagation();
             window.open(FLOYO_SITE, "_blank", "noopener,noreferrer");
         });
+        // A real package badge exists + is now branded (the Floyo platform) → hide the
+        // in-panel wordmark fallback so the logo never shows twice. Local frontends that
+        // render no badge never reach here, so their panel wordmark stays visible.
+        window.__fvsBadgeBranded = true;
+        try { document.querySelectorAll(".fvs-brand").forEach((b) => { b.style.display = "none"; }); } catch (_) {}
     });
 }
 
@@ -510,6 +518,21 @@ function setup(node) {
         wrap.appendChild(statusBar);
         state.statusBar = statusBar; state.statusFill = sFill; state.statusText = sText;
 
+        // Floyo wordmark in the panel footer — shows on EVERY frontend (the badge-branding
+        // only works where ComfyUI renders a package badge, e.g. the Floyo platform). If the
+        // badge DID get branded, this is auto-hidden (see brandBadges) so Floyo is unchanged.
+        const brand = document.createElement("a");
+        brand.className = "fvs-brand";
+        brand.href = FLOYO_SITE; brand.target = "_blank"; brand.rel = "noopener noreferrer";
+        brand.title = "Floyo";
+        const brandImg = document.createElement("img");
+        brandImg.src = FLOYO_LOGO_DATA_URL; brandImg.alt = "Floyo"; brandImg.draggable = false;
+        brand.appendChild(brandImg);
+        brand.addEventListener("mousedown", (e) => { e.preventDefault(); e.stopPropagation(); });
+        if (window.__fvsBadgeBranded) brand.style.display = "none";
+        wrap.appendChild(brand);
+        state.brand = brand;
+
         const onSlide = () => {
             const dur = state.meta.duration || 1;
             let lo = parseFloat(rMin.value) * dur;
@@ -544,7 +567,15 @@ function setup(node) {
         if (targetFramesW) wrapCb(targetFramesW, () => refresh(state));
         wrapCb(videoW, () => loadMeta(state, videoW.value));
 
-        node.addDOMWidget("fvs_ui", "floyo_video_studio", wrap, { serialize: false });
+        // Drive the node's height from the panel's REAL content height so the node box
+        // grows to contain it. Newer ComfyUI frontends read getHeight/getMinHeight; older
+        // ones (the Floyo platform) ignore these extra opts and keep working as before.
+        const _panelH = () => Math.max(300, wrap.scrollHeight || wrap.offsetHeight || 300);
+        state._domW = node.addDOMWidget("fvs_ui", "floyo_video_studio", wrap, {
+            serialize: false,
+            getHeight: _panelH,
+            getMinHeight: _panelH,
+        });
 
         // Watch the video widget for a value change from ANY path — the folder-icon combo,
         // our Choose/upload button, drag-drop, or a restored workflow — and register the
@@ -558,9 +589,45 @@ function setup(node) {
         [120, 600, 1500].forEach((d) => setTimeout(watchVideo, d));
         state._videoWatch = setInterval(watchVideo, 700);
         const _origRemoved = node.onRemoved;
-        node.onRemoved = function () { try { clearInterval(state._videoWatch); } catch (_) {} return _origRemoved ? _origRemoved.apply(this, arguments) : undefined; };
+        node.onRemoved = function () {
+            try { clearInterval(state._videoWatch); } catch (_) {}
+            try { state._ro && state._ro.disconnect(); } catch (_) {}
+            return _origRemoved ? _origRemoved.apply(this, arguments) : undefined;
+        };
 
-        if (!node.size || node.size[0] < 300) node.setSize?.([320, node.size ? node.size[1] : 380]);
+        // Start at a sane minimum (matches the prior behaviour) for a brand-new node.
+        if (!node.size || node.size[0] < 300) node.setSize([320, (node.size && node.size[1]) || 380]);
+        // Then GROW the node to contain the panel — ONLY ever grow, never shrink. So the
+        // Floyo frontend (which already auto-sizes this node correctly) is never disturbed;
+        // only an under-sized node (the newer local frontend, where the panel overflowed
+        // below the box) gets enlarged. Re-fit on content changes (video preview, status…).
+        const LG = window.LiteGraph || {};
+        const fitNode = () => {
+            try {
+                const w = Math.max(320, (node.size && node.size[0]) || 320);
+                let need = 0;
+                if (typeof node.computeSize === "function") {
+                    const c = node.computeSize([w, 0]);
+                    if (c && c[1]) need = Math.ceil(c[1]);
+                }
+                // Fallback estimate (in case computeSize doesn't fold in the DOM panel):
+                // title + the standard widgets above the panel + the panel's own height.
+                const widgets = node.widgets || [];
+                const domIdx = widgets.indexOf(state._domW);
+                const aboveN = domIdx >= 0 ? domIdx : Math.max(0, widgets.length - 1);
+                const wh = (LG.NODE_WIDGET_HEIGHT || 20) + 4;
+                const est = (LG.NODE_TITLE_HEIGHT || 30) + aboveN * wh + _panelH() + 10;
+                need = Math.max(need, est);
+                const cur = (node.size && node.size[1]) || 0;
+                if (need > cur + 4) {
+                    node.setSize([w, need]);
+                    node.setDirtyCanvas && node.setDirtyCanvas(true, true);
+                }
+            } catch (_) {}
+        };
+        fitNode();
+        [120, 400, 900, 1800].forEach((d) => setTimeout(fitNode, d));
+        try { state._ro = new ResizeObserver(() => fitNode()); state._ro.observe(wrap); } catch (_) {}
         refresh(state);
     } catch (e) {
         console.error("[Floyo Video Studio] setup failed:", e);
