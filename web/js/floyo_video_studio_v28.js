@@ -82,6 +82,14 @@ function fmtTime(s) {
     return `${m}:${String(sec).padStart(2, "0")}`;   // e.g. 4:31, like the native player
 }
 
+// Plain-seconds label so users aren't confused by the M:SS form (0:55 reads like 0.55).
+function fmtSecs(s) {
+    s = Math.max(0, Number(s) || 0);
+    const r = Math.round(s * 10) / 10;
+    const n = Number.isInteger(r) ? String(r) : r.toFixed(1);
+    return `${n} ${r === 1 ? "second" : "seconds"}`;   // e.g. "55 seconds"
+}
+
 function getWidget(node, name) {
     return (node.widgets || []).find((w) => w.name === name);
 }
@@ -462,7 +470,7 @@ function setup(node) {
 
         // ── Locked "source video" facts (the real fps + frame count). Look like
         //    fields but are read-only — just so you know what you're working with.
-        const head = document.createElement("div"); head.className = "fvs-sec"; head.textContent = "Source video";
+        const head = document.createElement("div"); head.className = "fvs-sec"; head.textContent = "Default video";
         wrap.appendChild(head);
         const mkField = (label) => {
             const f = document.createElement("div"); f.className = "fvs-field";
@@ -662,7 +670,7 @@ async function loadMeta(state, value) {
         state.meta.width = v.videoWidth || 0;
         state.meta.height = v.videoHeight || 0;
         state.endW.value = Math.round(v.duration * 100) / 100;
-        state.metaLabel.textContent = `Length ${fmtTime(v.duration)}`;
+        state.metaLabel.textContent = fmtSecs(v.duration);
         syncFromWidgets(state);
     }
 
@@ -727,7 +735,7 @@ async function loadMeta(state, value) {
     if (fpsPending) attachPassiveFps(state, v);
     if (state.meta.width || state.meta.duration) {
         const aud = state.meta.has_audio === undefined ? "" : (state.meta.has_audio ? " · 🔊 audio" : " · no audio");
-        state.metaLabel.textContent = `Length ${fmtTime(state.meta.duration)}${aud}`;
+        state.metaLabel.textContent = `${fmtSecs(state.meta.duration)}${aud}`;
     } else {
         state.metaLabel.textContent = "Could not read video info (the trim still works by seconds).";
     }
@@ -784,7 +792,7 @@ function refresh(state) {
             `Start <b>${fmtTime(lo)}</b> <span class="fvs-frames">(frame ${fLo})</span> → ` +
             `End <b>${fmtTime(hi)}</b> <span class="fvs-frames">(frame ${fHi})</span>` +
             `<div class="fvs-out">Output: <span class="fvs-frames">${nFrames} frames</span> · ` +
-            `<b>${efps || "—"} fps</b> · ${fmtTime(hi - lo)}</div>` +
+            `<b>${efps || "—"} fps</b> · <b>${fmtSecs(hi - lo)}</b></div>` +
             `<div class="fvs-mode">${modeHtml}</div>`;
         state.node?.setDirtyCanvas?.(true, true);
     } catch (_) {}
