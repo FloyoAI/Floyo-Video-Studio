@@ -713,10 +713,11 @@ function refresh(state) {
 
         let nFrames, efps, outDur, modeHtml;
         if (tframes > 0) {
-            // Exact count — the backend ignores fps + the frame controls in this mode.
+            // Exact count — the backend ignores fps + the frame controls in this mode and
+            // keeps the full trim timespan (out_fps = N / segDur), so the duration IS segDur.
             nFrames = tframes;
             efps = Math.round((tframes / segDur) * 10) / 10;
-            outDur = efps ? nFrames / efps : (hi - lo);
+            outDur = hi - lo;
             modeHtml = `<span class="fvs-on">Exact count</span> — fps auto (${efps}); ` +
                        `<span class="fvs-off">target_fps + frame controls ignored</span>`;
         } else {
@@ -732,8 +733,10 @@ function refresh(state) {
             if (nth > 1) { base = Math.ceil(base / nth); ofps = ofps / nth; }
             if (cap > 0) base = Math.min(base, cap);
             nFrames = base;
+            // Duration from the UNROUNDED fps (matches the backend's loaded_duration =
+            // frame_count / out_fps exactly); efps is only rounded for display.
+            outDur = ofps ? nFrames / ofps : 0;
             efps = Math.round(ofps * 100) / 100;
-            outDur = efps ? nFrames / efps : 0;
             const bits = [tfps > 0
                 ? `<span class="fvs-on">Target fps</span>${capped ? ` (capped to source ${Math.round(fps * 100) / 100})` : ""}`
                 : `Source fps`];
