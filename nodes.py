@@ -71,6 +71,9 @@ VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".mpg", ".m
 # Internal guard for the "all frames" path so a very long clip can't OOM. Users
 # who genuinely need more should downscale or set an exact target_frames.
 _ALL_FRAMES_SAFETY_CAP = 12000
+# Max output pixels (N*H*W) before we refuse with a clear error instead of OOM-crashing the
+# (shared) backend. ~3e9 px ≈ 12 GB as float32: e.g. ~360 4K frames, ~1450 @1080p, ~3300 @720p.
+_MAX_OUTPUT_PIXELS = 3_000_000_000
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -732,6 +735,12 @@ class FloyoVideoStudio:
             out_fps = float(target_fps) if target_fps and target_fps > 0 else src_fps
             if out_fps <= 0:
                 out_fps = src_fps
+            # Can't invent frames that don't exist: a target_fps ABOVE the source would
+            # otherwise mislabel the same frames as faster → wrong-speed (e.g. 2×) video.
+            # Cap at the source rate so the clip keeps its real duration. Decimating
+            # (target_fps < source) works normally. (Use select_every_nth for finer cuts.)
+            if src_fps > 0 and out_fps > src_fps:
+                out_fps = src_fps
             step = 1.0 / out_fps if out_fps else 0.0
 
         # ── FAST PATH: exact-N via decord — decodes ONLY the n requested frames by
@@ -745,6 +754,23 @@ class FloyoVideoStudio:
         pbar = _Progress(unique_id)
         _set_progress(pbar, 2)
         est_n = n_target if n_target > 0 else max(1, int(round(out_dur * out_fps)))
+
+        # OOM GUARD: source-res + all-frames of a long 4K clip can be a 100+ GB float tensor
+        # that would crash the (shared) backend. Estimate the FINAL output size (after the
+        # frame controls) and fail CLEARLY — pointing at the fix — instead of OOM-killing.
+        _est_final = est_n
+        if n_target <= 0:
+            _est_final = max(0, est_n - max(0, int(skip_first_frames)))
+            _nth_g = max(1, int(select_every_nth))
+            _est_final = -(-_est_final // _nth_g)  # ceil-divide
+            if frame_load_cap and frame_load_cap > 0:
+                _est_final = min(_est_final, int(frame_load_cap))
+        if _est_final * tw * th > _MAX_OUTPUT_PIXELS:
+            _gb = _est_final * tw * th * 4 / 1e9
+            raise RuntimeError(
+                f"Output would be too large (~{_est_final} frames × {tw}×{th} ≈ {_gb:.0f} GB "
+                f"in memory). Downscale with custom_width / custom_height, or take fewer "
+                f"frames with frame_load_cap / select_every_nth / target_frames.")
 
         do_downscale = bool(tw != src_tw or th != src_th)
         decord_batch = None
@@ -877,8 +903,20 @@ class FloyoVideoStudio:
             stacked = None
 
         _set_progress(pbar, 40)
-        audio = _extract_audio(path, start, end) if include_audio else _silent_audio()
         frame_count = int(images.shape[0])
+        # Keep AUDIO in sync with the video's ACTUAL content window so they don't drift
+        # when skip_first_frames / frame_load_cap SHORTEN the video. skip shifts the start
+        # (by skip / the decode fps) and the kept frames' playback length bounds the end.
+        # (select_every_nth keeps the full window at a lower fps, and target_frames keeps
+        # the full timespan — both already line up with start/end, so this is a no-op there.)
+        if include_audio:
+            _nth = int(select_every_nth) if (n_target <= 0 and int(select_every_nth) > 1) else 1
+            _dec_fps = out_fps * _nth  # the fps frames were decoded at, before every-nth
+            _a_start = start + ((int(skip_first_frames) / _dec_fps) if (n_target <= 0 and _dec_fps > 0) else 0.0)
+            _a_end = _a_start + (frame_count / out_fps if out_fps else 0.0)
+            audio = _extract_audio(path, _a_start, _a_end)
+        else:
+            audio = _silent_audio()
         has_real_audio = bool(include_audio and meta.get("has_audio"))
 
         # Assemble the headline `video` output: the exact frames we kept (trim + downscale
