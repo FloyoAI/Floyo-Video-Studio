@@ -1,8 +1,9 @@
 """Floyo Video Studio — one hosted-safe node to load a video and get its parts.
 
 Design goals (why this exists vs VideoHelperSuite):
-  * TRIM BY TIME (start/end seconds), shown alongside frame count — not frame-index.
-  * 1-CLICK DOWNSCALE presets (Source / 1080p / 720p / 480p).
+  * TRIM BY TIME (start/end seconds) PLUS VHS-style frame controls (skip_first_frames /
+    select_every_nth / frame_load_cap) and custom_width/height resolution.
+  * A real VIDEO output + a bundled video_info (VHS-compatible) alongside the frames.
   * MEMORY-LIGHT: seek by time + scale + fps-decimate INSIDE the decode graph, so we
     only ever materialise the frames we keep, at the target resolution — no OOM on
     long / 4K clips (the #1 VHS failure mode).
@@ -67,7 +68,6 @@ except Exception:
         _HAS_VIDEO_API = False
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg", ".gif")
-QUALITY_PRESETS = {"Source": None, "1080p": 1080, "720p": 720, "480p": 480}
 # Internal guard for the "all frames" path so a very long clip can't OOM. Users
 # who genuinely need more should downscale or set an exact target_frames.
 _ALL_FRAMES_SAFETY_CAP = 12000
@@ -613,11 +613,23 @@ class FloyoVideoStudio:
                                             "tooltip": "Trim start (seconds)."}),
                 "end_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.1,
                                           "tooltip": "Trim end (seconds). 0 = until the end."}),
-                "quality": (list(QUALITY_PRESETS.keys()), {"tooltip": "Downscale preset. Never upscales."}),
+                # VHS-style resolution: exact px like Load Video's custom_width/height
+                # (replaces the old quality preset). 0 = keep source for that dimension.
+                "custom_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                                         "tooltip": "Output width in px. 0 = keep source. If only width is set, height scales to keep aspect."}),
+                "custom_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 8,
+                                          "tooltip": "Output height in px. 0 = keep source. If only height is set, width scales to keep aspect."}),
                 "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 240.0, "step": 1.0,
-                                         "tooltip": "Output frames-per-second. 0 = keep the video's own fps. Lower = fewer frames."}),
+                                         "tooltip": "Force output fps (VHS force_rate). 0 = keep the video's own fps. Lower = fewer frames."}),
+                # VHS frame controls — the ones AI workflows actually use.
+                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
+                                           "tooltip": "Load at most this many frames. 0 = no cap (VHS frame_load_cap)."}),
+                "skip_first_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
+                                              "tooltip": "Skip this many frames from the start of the trim (VHS skip_first_frames)."}),
+                "select_every_nth": ("INT", {"default": 1, "min": 1, "max": 1000, "step": 1,
+                                             "tooltip": "Keep every Nth frame — 1 = all (VHS select_every_nth). Lowers the effective fps."}),
                 "target_frames": ("INT", {"default": 0, "min": 0, "max": 100000,
-                                          "tooltip": "Output EXACTLY this many frames, evenly sampled across the trim — for models that need a specific count (e.g. 81). Overrides fps. 0 = all frames."}),
+                                          "tooltip": "Output EXACTLY this many frames, evenly sampled across the trim — for models that need a specific count (e.g. 81). Overrides fps + the frame controls above. 0 = off."}),
                 "include_audio": ("BOOLEAN", {"default": True, "tooltip": "Also output the trimmed audio."}),
             },
             # The node id — so we can push trim progress to OUR own panel bar (a custom
@@ -625,8 +637,8 @@ class FloyoVideoStudio:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("VIDEO", "IMAGE", "AUDIO", "FLOAT", "INT")
-    RETURN_NAMES = ("video", "frames", "audio", "fps", "frame_count")
+    RETURN_TYPES = ("VIDEO", "IMAGE", "AUDIO", "FLOAT", "INT", "VHS_VIDEOINFO")
+    RETURN_NAMES = ("video", "frames", "audio", "fps", "frame_count", "video_info")
     OUTPUT_TOOLTIPS = (
         "The trimmed + downscaled video — wire it straight into a video-to-video AI node "
         "(Kling / Krea / Grok / Pixverse / Lightx…) or Save Video. Carries the audio too.",
@@ -634,6 +646,8 @@ class FloyoVideoStudio:
         "Trimmed audio (silent if none / disabled).",
         "Output frames-per-second — wire to Video Combine's frame_rate so the rebuilt video plays at the right speed.",
         "Output frame count.",
+        "All metadata bundled — source & loaded fps / width / height / frame-count / duration. "
+        "VHS-compatible; unpack it with the '🎬 Floyo Video Info' node (or any VHS Video Info node).",
     )
     FUNCTION = "process"
     CATEGORY = "Floyo/Video"
@@ -650,14 +664,20 @@ class FloyoVideoStudio:
         return "No video selected."
 
     @classmethod
-    def IS_CHANGED(cls, video, start_seconds, end_seconds, quality, target_fps, target_frames, include_audio):
+    def IS_CHANGED(cls, video, start_seconds, end_seconds, custom_width, custom_height,
+                   target_fps, frame_load_cap, skip_first_frames, select_every_nth,
+                   target_frames, include_audio):
         try:
             path = _safe_input_path(video)
-            return f"{path}:{os.path.getmtime(path)}:{start_seconds}:{end_seconds}:{quality}:{target_fps}:{target_frames}:{include_audio}"
+            return (f"{path}:{os.path.getmtime(path)}:{start_seconds}:{end_seconds}:"
+                    f"{custom_width}:{custom_height}:{target_fps}:{frame_load_cap}:"
+                    f"{skip_first_frames}:{select_every_nth}:{target_frames}:{include_audio}")
         except Exception:
             return float("nan")
 
-    def process(self, video, start_seconds, end_seconds, quality, target_fps, target_frames, include_audio, unique_id=None):
+    def process(self, video, start_seconds, end_seconds, custom_width, custom_height,
+                target_fps, frame_load_cap, skip_first_frames, select_every_nth,
+                target_frames, include_audio, unique_id=None):
         if not _HAS_AV:
             raise RuntimeError(
                 "Floyo Video Studio needs PyAV. Install it on the server: pip install av  "
@@ -682,13 +702,22 @@ class FloyoVideoStudio:
         if end <= start:
             end = duration if (duration and duration > start) else (start + 1.0 / src_fps * 2)
 
-        # Target resolution — DOWNSCALE only (never upscale), even dims.
-        preset_h = QUALITY_PRESETS.get(quality)
-        if preset_h and src_h and src_h > preset_h:
-            scale = preset_h / float(src_h)
-            tw, th = _even(src_w * scale), _even(preset_h)
+        # Target resolution — VHS custom_width / custom_height (exact px). 0 = keep source
+        # for that dim; if only one is set, the other scales to preserve aspect. Even dims.
+        # (Can upscale, matching VHS — the old "never upscale" preset was replaced.)
+        cw = max(0, int(custom_width))
+        ch = max(0, int(custom_height))
+        src_tw, src_th = _even(src_w or 16), _even(src_h or 16)
+        if cw > 0 and ch > 0:
+            tw, th = _even(cw), _even(ch)
+        elif cw > 0:
+            tw = _even(cw)
+            th = _even(src_h * (cw / src_w)) if src_w else src_th
+        elif ch > 0:
+            th = _even(ch)
+            tw = _even(src_w * (ch / src_h)) if src_h else src_tw
         else:
-            tw, th = _even(src_w or 16), _even(src_h or 16)
+            tw, th = src_tw, src_th
 
         out_dur = max(1e-6, end - start)
         n_target = int(target_frames) if target_frames else 0
@@ -717,7 +746,7 @@ class FloyoVideoStudio:
         _set_progress(pbar, 2)
         est_n = n_target if n_target > 0 else max(1, int(round(out_dur * out_fps)))
 
-        do_downscale = bool(preset_h and src_h and src_h > preset_h)
+        do_downscale = bool(tw != src_tw or th != src_th)
         decord_batch = None
         frames = []
         if _av1:
@@ -798,6 +827,37 @@ class FloyoVideoStudio:
             if not frames:
                 raise RuntimeError("No frames found in the selected time range — widen start/end.")
 
+        # ── VHS frame controls (skip_first_frames / select_every_nth / frame_load_cap) —
+        #    applied to the decoded window. Only in the "load frames" mode; the exact-N
+        #    (target_frames) mode already picked a specific set, so these are skipped there.
+        #    select_every_nth lowers the effective fps (fewer frames over the same time).
+        if n_target <= 0:
+            _skip = max(0, int(skip_first_frames))
+            _nth = max(1, int(select_every_nth))
+            _cap = int(frame_load_cap) if (frame_load_cap and frame_load_cap > 0) else 0
+            if decord_batch is not None:
+                if _skip:
+                    decord_batch = decord_batch[_skip:]
+                if _nth > 1:
+                    decord_batch = decord_batch[::_nth]
+                if _cap:
+                    decord_batch = decord_batch[:_cap]
+                _left = int(decord_batch.shape[0])
+            else:
+                if _skip:
+                    frames = frames[_skip:]
+                if _nth > 1:
+                    frames = frames[::_nth]
+                if _cap:
+                    frames = frames[:_cap]
+                _left = len(frames)
+            if _nth > 1 and out_fps:
+                out_fps = round(out_fps / _nth, 4)
+            if _left <= 0:
+                raise RuntimeError(
+                    "No frames left after skip_first_frames / select_every_nth / frame_load_cap "
+                    "— loosen those values.")
+
         # Build the (N,H,W,3) float tensor. decord gives one contiguous uint8 array;
         # the PyAV path fills a pre-allocated buffer with one in-place scale (frames
         # freed as we go → low peak memory on weak machines).
@@ -862,10 +922,26 @@ class FloyoVideoStudio:
                 video_out = None
         _set_progress(pbar, 100)
 
-        # video → for video-to-video AI / Save Video; frames → per-frame work; plus the
-        # audio, the fps (Video Combine's frame_rate) and the count. The trim/quality
-        # the user picked are already baked in, so width/height/duration aren't outputs.
-        return (video_out, images, audio, float(out_fps), frame_count)
+        # Bundle ALL metadata (VHS-compatible dict) so downstream nodes can pull source +
+        # loaded fps / dims / frame-count / duration off ONE wire (unpack with Floyo Video
+        # Info, or any VHS Video Info node — the keys match VHS_VIDEOINFO exactly).
+        loaded_dur = round(frame_count / out_fps, 4) if out_fps else 0.0
+        video_info = {
+            "source_fps": float(src_fps),
+            "source_frame_count": int(meta.get("frame_count") or 0),
+            "source_duration": float(duration),
+            "source_width": int(src_w or 0),
+            "source_height": int(src_h or 0),
+            "loaded_fps": float(out_fps),
+            "loaded_frame_count": int(frame_count),
+            "loaded_duration": float(loaded_dur),
+            "loaded_width": int(images.shape[2]),
+            "loaded_height": int(images.shape[1]),
+        }
+
+        # video → video-to-video AI / Save Video; frames → per-frame work; audio; fps
+        # (Video Combine's frame_rate); count; plus the bundled video_info.
+        return (video_out, images, audio, float(out_fps), frame_count, video_info)
 
 
 # ───────────────────────── server route (metadata for the JS slider) ─────────────────────────
@@ -908,5 +984,44 @@ except Exception:
     pass
 
 
-NODE_CLASS_MAPPINGS = {"FloyoVideoStudio": FloyoVideoStudio}
-NODE_DISPLAY_NAME_MAPPINGS = {"FloyoVideoStudio": "🎬 Floyo Video Studio"}
+# ───────────────────────── Video Info unpacker ─────────────────────────
+class FloyoVideoInfo:
+    """Unpack the `video_info` bundle from Floyo Video Studio (or any VHS Load Video) into
+    individual values — source & loaded fps / width / height / frame-count / duration.
+    Input type is VHS_VIDEOINFO, so it's cross-compatible with VideoHelperSuite."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video_info": ("VHS_VIDEOINFO", {"tooltip": "The video_info output."})}}
+
+    RETURN_TYPES = ("FLOAT", "INT", "FLOAT", "INT", "INT",
+                    "FLOAT", "INT", "FLOAT", "INT", "INT")
+    RETURN_NAMES = ("source_fps", "source_frame_count", "source_duration", "source_width", "source_height",
+                    "loaded_fps", "loaded_frame_count", "loaded_duration", "loaded_width", "loaded_height")
+    FUNCTION = "run"
+    CATEGORY = "Floyo/Video"
+
+    def run(self, video_info):
+        d = video_info if isinstance(video_info, dict) else {}
+
+        def g(k, default=0):
+            try:
+                return d.get(k, default)
+            except Exception:
+                return default
+        return (
+            float(g("source_fps")), int(g("source_frame_count")), float(g("source_duration")),
+            int(g("source_width")), int(g("source_height")),
+            float(g("loaded_fps")), int(g("loaded_frame_count")), float(g("loaded_duration")),
+            int(g("loaded_width")), int(g("loaded_height")),
+        )
+
+
+NODE_CLASS_MAPPINGS = {
+    "FloyoVideoStudio": FloyoVideoStudio,
+    "FloyoVideoInfo": FloyoVideoInfo,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "FloyoVideoStudio": "🎬 Floyo Video Studio",
+    "FloyoVideoInfo": "🎬 Floyo Video Info",
+}
