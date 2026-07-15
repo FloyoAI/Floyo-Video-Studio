@@ -68,12 +68,18 @@ except Exception:
         _HAS_VIDEO_API = False
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".mpg", ".mpeg", ".gif")
-# Internal guard for the "all frames" path so a very long clip can't OOM. Users
-# who genuinely need more should downscale or set an exact target_frames.
-_ALL_FRAMES_SAFETY_CAP = 12000
-# Max output pixels (N*H*W) before we refuse with a clear error instead of OOM-crashing the
-# (shared) backend. ~3e9 px ≈ 12 GB as float32: e.g. ~360 4K frames, ~1450 @1080p, ~3300 @720p.
-_MAX_OUTPUT_PIXELS = 3_000_000_000
+# Adaptive memory management. Rather than a FIXED cap — which both needlessly throttles
+# Floyo's big GPUs AND still OOMs a laptop — we measure the machine's REAL available RAM
+# at run time and fit the decoded output to it:
+#   * Roomy host (e.g. Floyo's 96 GB GPUs): the budget dwarfs the clip → nothing changes,
+#     full resolution + every frame at full speed.
+#   * Small box (a laptop / 8 GB container): the resolution is auto-downscaled (aspect kept,
+#     every frame + the real fps/duration kept) so the clip still loads instead of crashing
+#     the backend. loaded_width/height always report the TRUE output dims, so downstream
+#     frame/duration counts stay exact.
+_MEM_BUDGET_FRAC = 0.55    # share of available RAM the float32 frames tensor may occupy
+_MIN_FIT_DIM = 64          # never auto-shrink a side below this many px
+_ABS_FRAME_CAP = 200000    # absolute backstop so a decode can never run truly unbounded
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -130,6 +136,62 @@ def _fmt_time(s):
     m = int(s // 60)
     sec = s - m * 60
     return f"{m:02d}:{sec:04.1f}"
+
+
+def _available_memory_bytes():
+    """Best-effort *available* RAM for this process, CONTAINER-AWARE. Returns the most
+    restrictive real limit found — cgroup v2/v1 (limit − current usage) and the host-level
+    available (psutil, else POSIX) — or a modest default if nothing is readable. Drives the
+    adaptive fit so we downscale to memory on a small box but never throttle a big one."""
+    vals = []
+    # cgroup v2 (the pod): memory.max may be the literal "max" (unlimited) → skip.
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw = f.read().strip()
+        if raw and raw != "max":
+            limit = int(raw)
+            used = 0
+            try:
+                with open("/sys/fs/cgroup/memory.current") as f:
+                    used = int(f.read().strip())
+            except Exception:
+                pass
+            vals.append(max(1, limit - used))
+    except Exception:
+        pass
+    # cgroup v1: limit_in_bytes uses a huge sentinel (~1<<62) when unlimited.
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
+            limit = int(f.read().strip())
+        if 0 < limit < (1 << 62):
+            used = 0
+            try:
+                with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
+                    used = int(f.read().strip())
+            except Exception:
+                pass
+            vals.append(max(1, limit - used))
+    except Exception:
+        pass
+    # host-level available (a laptop with no cgroup limit): psutil, else POSIX pages.
+    try:
+        import psutil
+        vals.append(int(psutil.virtual_memory().available))
+    except Exception:
+        try:
+            vals.append(int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")))
+        except Exception:
+            pass
+    if not vals:
+        return 6 * (1 << 30)  # unknown → assume a modest 6 GB and fit conservatively
+    return max(1, min(vals))
+
+
+def _out_frame_cap(budget_bytes, w, h):
+    """How many (w×h×3 float32) frames fit the memory budget — a backstop so an unexpectedly
+    long decode fills to the budget and stops, never beyond. Bounded to [1, _ABS_FRAME_CAP]."""
+    per = max(1, int(w) * int(h) * 3 * 4)
+    return int(max(1, min(_ABS_FRAME_CAP, budget_bytes // per)))
 
 
 def _meta_from_container(c):
@@ -358,7 +420,7 @@ def _is_av1(path):
     return False
 
 
-def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target):
+def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target, max_frames=_ABS_FRAME_CAP):
     """Decode an AV1 trim window STRAIGHT to scaled RGB frames using imageio-ffmpeg's
     bundled dav1d ffmpeg — NO H.264 re-encode (re-encoding 4K with libx264 on CPU was the
     3–4 min slowdown). One ffmpeg pass seeks to `start`, scales to tw×th, and pipes raw
@@ -396,8 +458,8 @@ def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target):
             if not buf or len(buf) < fsz:
                 break
             frames.append(np.frombuffer(buf, dtype=np.uint8).reshape(th, tw, 3))
-            if len(frames) >= _ALL_FRAMES_SAFETY_CAP:
-                break  # internal guard so a huge clip can't OOM
+            if len(frames) >= max_frames:
+                break  # budget/backstop cap so a huge clip fills to the budget, not beyond
     finally:
         try:
             proc.stdout.close()
@@ -755,9 +817,8 @@ class FloyoVideoStudio:
         _set_progress(pbar, 2)
         est_n = n_target if n_target > 0 else max(1, int(round(out_dur * out_fps)))
 
-        # OOM GUARD: source-res + all-frames of a long 4K clip can be a 100+ GB float tensor
-        # that would crash the (shared) backend. Estimate the FINAL output size (after the
-        # frame controls) and fail CLEARLY — pointing at the fix — instead of OOM-killing.
+        # Estimate the FINAL output frame count (after the frame controls) so we can size the
+        # decode to the machine's memory below.
         _est_final = est_n
         if n_target <= 0:
             _est_final = max(0, est_n - max(0, int(skip_first_frames)))
@@ -765,12 +826,29 @@ class FloyoVideoStudio:
             _est_final = -(-_est_final // _nth_g)  # ceil-divide
             if frame_load_cap and frame_load_cap > 0:
                 _est_final = min(_est_final, int(frame_load_cap))
-        if _est_final * tw * th > _MAX_OUTPUT_PIXELS:
-            _gb = _est_final * tw * th * 4 / 1e9
-            raise RuntimeError(
-                f"Output would be too large (~{_est_final} frames × {tw}×{th} ≈ {_gb:.0f} GB "
-                f"in memory). Downscale with custom_width / custom_height, or take fewer "
-                f"frames with frame_load_cap / select_every_nth / target_frames.")
+
+        # ── ADAPTIVE MEMORY FIT (replaces the old hard OOM error) ──────────────────────────
+        # Fit the output to the machine's REAL available RAM. On a roomy host the budget
+        # dwarfs the clip → tw/th unchanged, full quality + full speed. On a small box the
+        # resolution is auto-downscaled (aspect kept, every frame + real fps/duration kept)
+        # so it LOADS instead of OOM-killing the backend. No user-facing error, no silent
+        # crash — and loaded_width/height report the true dims so counts stay exact.
+        _avail = _available_memory_bytes()
+        _budget = max(1, int(_avail * _MEM_BUDGET_FRAC))
+        if _est_final > 0:
+            _need = _est_final * tw * th * 3 * 4  # float32 RGB bytes
+            if _need > _budget:
+                _s = max(1e-4, _budget / float(_need)) ** 0.5  # bytes ∝ tw*th → sqrt per side
+                _tw2 = _even(max(_MIN_FIT_DIM, int(tw * _s)))
+                _th2 = _even(max(_MIN_FIT_DIM, int(th * _s)))
+                if (_tw2, _th2) != (tw, th):
+                    print(f"[FloyoVideoStudio] auto-fit to memory: {tw}x{th} -> {_tw2}x{_th2} "
+                          f"for ~{_est_final} frames (avail ~{_avail / 1e9:.1f} GB). Set "
+                          f"custom_width/height or frame_load_cap to control this.", flush=True)
+                    tw, th = _tw2, _th2
+        # Cap decoded frames to what the budget holds at the FINAL resolution — a backstop so
+        # an unexpectedly long clip fills to the budget and stops, never past it.
+        _frame_cap = _out_frame_cap(_budget, tw, th)
 
         do_downscale = bool(tw != src_tw or th != src_th)
         decord_batch = None
@@ -779,7 +857,8 @@ class FloyoVideoStudio:
             # FAST AV1: decode the trim window straight to scaled RGB frames via
             # imageio-ffmpeg's bundled dav1d ffmpeg — no slow H.264 re-encode. PyAV and
             # decord can't decode AV1, so both are skipped for these clips.
-            frames = _decode_av1_frames(path, start, end, tw, th, out_fps, n_target)
+            frames = _decode_av1_frames(path, start, end, tw, th, out_fps, n_target,
+                                        max_frames=_frame_cap)
             _set_progress(pbar, 40)
         elif n_target > 0 and _HAS_DECORD:
             window_frames = max(1, int(round(out_dur * src_fps)))
@@ -840,8 +919,8 @@ class FloyoVideoStudio:
                                 next_capture = t + step
                             if pbar is not None and (len(frames) & 7) == 0:
                                 _set_progress(pbar, min(38, 2 + 38 * len(frames) / est_n))
-                            if len(frames) >= _ALL_FRAMES_SAFETY_CAP:
-                                break  # internal guard so a huge clip can't OOM
+                            if len(frames) >= _frame_cap:
+                                break  # budget cap: fill to the memory budget, not beyond
             except Exception as e:
                 m = str(e).lower()
                 if "av1" in m or "send_packet" in m or "get current frame" in m:
@@ -884,23 +963,31 @@ class FloyoVideoStudio:
                     "No frames left after skip_first_frames / select_every_nth / frame_load_cap "
                     "— loosen those values.")
 
-        # Build the (N,H,W,3) float tensor. decord gives one contiguous uint8 array;
-        # the PyAV path fills a pre-allocated buffer with one in-place scale (frames
-        # freed as we go → low peak memory on weak machines).
+        # Build the (N,H,W,3) float32 tensor with a BOUNDED peak: pre-allocate the output and
+        # fill it in small CHUNKS, freeing the uint8 source as we go — so peak memory is the
+        # float tensor plus one small chunk, not the tensor PLUS a full uint8 copy (the old
+        # np.stack + convert briefly held ~5× the source). Chunked (not per-frame) keeps the
+        # torch casts vectorised, so it stays fast on big machines too.
+        _CH = 32
         if decord_batch is not None:
-            # torch's uint8→float cast is multithreaded — far quicker than numpy's
-            # single-threaded astype on a big 4K batch.
-            images = torch.from_numpy(np.ascontiguousarray(decord_batch)).to(torch.float32)
-            images.div_(255.0)
+            N = int(decord_batch.shape[0])
+            images = torch.empty((N, int(decord_batch.shape[1]), int(decord_batch.shape[2]), 3),
+                                 dtype=torch.float32)
+            for i in range(0, N, _CH):
+                sl = np.ascontiguousarray(decord_batch[i:i + _CH])
+                images[i:i + sl.shape[0]] = torch.from_numpy(sl).to(torch.float32).div_(255.0)
+            decord_batch = None
         else:
-            # Stack once (one C-level copy) then convert with torch (multithreaded),
-            # instead of a Python per-frame float loop — that loop was ~64s for a 4K
-            # 300-frame batch; this is a few times faster and frees the uint8 source.
-            stacked = np.stack(frames)
+            N = len(frames)
+            h0, w0 = int(frames[0].shape[0]), int(frames[0].shape[1])
+            images = torch.empty((N, h0, w0, 3), dtype=torch.float32)
+            for i in range(0, N, _CH):
+                chunk = frames[i:i + _CH]
+                arr = np.stack(chunk) if len(chunk) > 1 else chunk[0][None]
+                images[i:i + arr.shape[0]] = torch.from_numpy(arr).to(torch.float32).div_(255.0)
+                for k in range(i, min(i + _CH, N)):
+                    frames[k] = None  # free decoded source promptly → low peak on weak boxes
             frames = None
-            images = torch.from_numpy(stacked).to(torch.float32)
-            images.div_(255.0)
-            stacked = None
 
         _set_progress(pbar, 40)
         frame_count = int(images.shape[0])
