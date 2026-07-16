@@ -1112,7 +1112,7 @@ except Exception:
 # ───────────────────────── Video Info unpacker ─────────────────────────
 class FloyoVideoInfo:
     """Unpack the `video_info` bundle from Floyo Video Studio (or any VHS Load Video) into
-    individual values. Labels are beginner-friendly — "Original …" = the video as uploaded,
+    individual values. Labels are beginner-friendly — "Default …" = the video as uploaded,
     "Output …" = what this node produces after trim / resize / fps. Under the hood the input
     is still VHS_VIDEOINFO (source_* / loaded_* keys), so it stays cross-compatible with
     VideoHelperSuite; only the visible port names are the friendlier ones."""
@@ -1123,9 +1123,9 @@ class FloyoVideoInfo:
 
     RETURN_TYPES = ("FLOAT", "INT", "FLOAT", "INT", "INT",
                     "FLOAT", "INT", "FLOAT", "INT", "INT")
-    # Friendly, non-technical labels. "Original …" = the uploaded video, as-is.
+    # Friendly, non-technical labels. "Default …" = the uploaded video, as-is.
     # "Output …" = what comes out of Floyo Video Studio (after trim / resize / fps).
-    RETURN_NAMES = ("Original FPS", "Original Frames", "Original Duration", "Original Width", "Original Height",
+    RETURN_NAMES = ("Default FPS", "Default Frames", "Default Duration", "Default Width", "Default Height",
                     "Output FPS", "Output Frames", "Output Duration", "Output Width", "Output Height")
     OUTPUT_TOOLTIPS = (
         "The uploaded video's frames-per-second (before any changes).",
