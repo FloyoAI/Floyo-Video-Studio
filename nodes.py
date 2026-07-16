@@ -1112,17 +1112,33 @@ except Exception:
 # ───────────────────────── Video Info unpacker ─────────────────────────
 class FloyoVideoInfo:
     """Unpack the `video_info` bundle from Floyo Video Studio (or any VHS Load Video) into
-    individual values — source & loaded fps / width / height / frame-count / duration.
-    Input type is VHS_VIDEOINFO, so it's cross-compatible with VideoHelperSuite."""
+    individual values. Labels are beginner-friendly — "Original …" = the video as uploaded,
+    "Output …" = what this node produces after trim / resize / fps. Under the hood the input
+    is still VHS_VIDEOINFO (source_* / loaded_* keys), so it stays cross-compatible with
+    VideoHelperSuite; only the visible port names are the friendlier ones."""
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"video_info": ("VHS_VIDEOINFO", {"tooltip": "The video_info output."})}}
+        return {"required": {"video_info": ("VHS_VIDEOINFO", {"tooltip": "The video_info output from Floyo Video Studio (or a VHS Load Video)."})}}
 
     RETURN_TYPES = ("FLOAT", "INT", "FLOAT", "INT", "INT",
                     "FLOAT", "INT", "FLOAT", "INT", "INT")
-    RETURN_NAMES = ("source_fps", "source_frame_count", "source_duration", "source_width", "source_height",
-                    "loaded_fps", "loaded_frame_count", "loaded_duration", "loaded_width", "loaded_height")
+    # Friendly, non-technical labels. "Original …" = the uploaded video, as-is.
+    # "Output …" = what comes out of Floyo Video Studio (after trim / resize / fps).
+    RETURN_NAMES = ("Original FPS", "Original Frames", "Original Duration", "Original Width", "Original Height",
+                    "Output FPS", "Output Frames", "Output Duration", "Output Width", "Output Height")
+    OUTPUT_TOOLTIPS = (
+        "The uploaded video's frames-per-second (before any changes).",
+        "The uploaded video's total number of frames.",
+        "The uploaded video's length, in seconds.",
+        "The uploaded video's width, in pixels.",
+        "The uploaded video's height, in pixels.",
+        "Frames-per-second of what this node outputs (after trim / resize / fps).",
+        "Number of frames in the output.",
+        "Length of the output, in seconds.",
+        "Width of the output, in pixels.",
+        "Height of the output, in pixels.",
+    )
     FUNCTION = "run"
     CATEGORY = "Floyo/Video"
 
