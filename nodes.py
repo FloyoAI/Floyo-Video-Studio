@@ -138,9 +138,26 @@ def _fmt_time(s):
     return f"{m:02d}:{sec:04.1f}"
 
 
+def _cgroup_stat_reclaimable(stat_path, keys):
+    """Sum the given page-cache counters from a cgroup memory.stat file. Page cache is
+    reclaimable — the kernel drops it under pressure — so it must NOT count as 'used'
+    (a pod that has streamed big model files shows usage ≈ limit purely from file cache)."""
+    out = 0
+    try:
+        with open(stat_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in keys:
+                    out += int(parts[1])
+    except Exception:
+        pass
+    return out
+
+
 def _available_memory_bytes():
     """Best-effort *available* RAM for this process, CONTAINER-AWARE. Returns the most
-    restrictive real limit found — cgroup v2/v1 (limit − current usage) and the host-level
+    restrictive real limit found — cgroup v2/v1 (limit − working set, where working set =
+    usage MINUS reclaimable page cache, the docker/k8s convention) and the host-level
     available (psutil, else POSIX) — or a modest default if nothing is readable. Drives the
     adaptive fit so we downscale to memory on a small box but never throttle a big one."""
     vals = []
@@ -156,7 +173,8 @@ def _available_memory_bytes():
                     used = int(f.read().strip())
             except Exception:
                 pass
-            vals.append(max(1, limit - used))
+            used -= _cgroup_stat_reclaimable("/sys/fs/cgroup/memory.stat", ("file",))
+            vals.append(max(1, limit - max(0, used)))
     except Exception:
         pass
     # cgroup v1: limit_in_bytes uses a huge sentinel (~1<<62) when unlimited.
@@ -170,7 +188,9 @@ def _available_memory_bytes():
                     used = int(f.read().strip())
             except Exception:
                 pass
-            vals.append(max(1, limit - used))
+            used -= _cgroup_stat_reclaimable("/sys/fs/cgroup/memory/memory.stat",
+                                             ("total_cache",))
+            vals.append(max(1, limit - max(0, used)))
     except Exception:
         pass
     # host-level available (a laptop with no cgroup limit): psutil, else POSIX pages.
@@ -420,7 +440,8 @@ def _is_av1(path):
     return False
 
 
-def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target, max_frames=_ABS_FRAME_CAP):
+def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target, max_frames=_ABS_FRAME_CAP,
+                       skip=0, nth=1, ucap=0):
     """Decode an AV1 trim window STRAIGHT to scaled RGB frames using imageio-ffmpeg's
     bundled dav1d ffmpeg — NO H.264 re-encode (re-encoding 4K with libx264 on CPU was the
     3–4 min slowdown). One ffmpeg pass seeks to `start`, scales to tw×th, and pipes raw
@@ -452,14 +473,26 @@ def _decode_av1_frames(path, start, end, tw, th, out_fps, n_target, max_frames=_
     fsz = tw * th * 3
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     frames = []
+    _fps_mode = not (n_target and n_target > 0)
+    _skip = max(0, int(skip)) if _fps_mode else 0
+    _nth = max(1, int(nth)) if _fps_mode else 1
+    _ucap = int(ucap) if (_fps_mode and ucap and ucap > 0) else 0
+    _seen = 0
     try:
         while True:
             buf = proc.stdout.read(fsz)
             if not buf or len(buf) < fsz:
                 break
+            if _fps_mode:
+                # skip / every-nth applied inline — skipped frames are read off the pipe
+                # but never stored, so memory matches the budget and cap can stop early.
+                keep = _seen >= _skip and ((_seen - _skip) % _nth == 0)
+                _seen += 1
+                if not keep:
+                    continue
             frames.append(np.frombuffer(buf, dtype=np.uint8).reshape(th, tw, 3))
-            if len(frames) >= max_frames:
-                break  # budget/backstop cap so a huge clip fills to the budget, not beyond
+            if (_ucap and len(frames) >= _ucap) or len(frames) >= max_frames:
+                break  # asked-for count reached / budget-backstop cap
     finally:
         try:
             proc.stdout.close()
@@ -858,7 +891,9 @@ class FloyoVideoStudio:
             # imageio-ffmpeg's bundled dav1d ffmpeg — no slow H.264 re-encode. PyAV and
             # decord can't decode AV1, so both are skipped for these clips.
             frames = _decode_av1_frames(path, start, end, tw, th, out_fps, n_target,
-                                        max_frames=_frame_cap)
+                                        max_frames=_frame_cap,
+                                        skip=int(skip_first_frames), nth=int(select_every_nth),
+                                        ucap=int(frame_load_cap or 0))
             _set_progress(pbar, 40)
         elif n_target > 0 and _HAS_DECORD:
             window_frames = max(1, int(round(out_dur * src_fps)))
@@ -901,6 +936,14 @@ class FloyoVideoStudio:
                             frames.append(last_nd)
                             ti += 1
                     else:
+                        # skip_first_frames / select_every_nth / frame_load_cap are applied
+                        # INLINE, at decode time: skipped frames are never stored (so memory
+                        # matches what the budget was sized for) and frame_load_cap stops the
+                        # decode early instead of decoding everything and slicing later.
+                        _skip_n = max(0, int(skip_first_frames))
+                        _nth_n = max(1, int(select_every_nth))
+                        _ucap_n = int(frame_load_cap) if (frame_load_cap and frame_load_cap > 0) else 0
+                        _seen = 0  # frames that passed the fps cadence
                         next_capture = start
                         for frame in c.decode(v):
                             t = frame.time
@@ -912,15 +955,18 @@ class FloyoVideoStudio:
                                 break
                             if step and (t + 1e-4) < next_capture:
                                 continue
-                            nd = frame.reformat(width=tw, height=th, format="rgb24").to_ndarray()
-                            frames.append(nd)
                             next_capture += step if step else 0.0
                             if next_capture < t:
                                 next_capture = t + step
+                            keep = _seen >= _skip_n and ((_seen - _skip_n) % _nth_n == 0)
+                            _seen += 1
+                            if not keep:
+                                continue
+                            frames.append(frame.reformat(width=tw, height=th, format="rgb24").to_ndarray())
                             if pbar is not None and (len(frames) & 7) == 0:
-                                _set_progress(pbar, min(38, 2 + 38 * len(frames) / est_n))
-                            if len(frames) >= _frame_cap:
-                                break  # budget cap: fill to the memory budget, not beyond
+                                _set_progress(pbar, min(38, 2 + 38 * len(frames) / max(1, _est_final)))
+                            if (_ucap_n and len(frames) >= _ucap_n) or len(frames) >= _frame_cap:
+                                break  # asked-for count reached / memory budget full
             except Exception as e:
                 m = str(e).lower()
                 if "av1" in m or "send_packet" in m or "get current frame" in m:
@@ -930,17 +976,21 @@ class FloyoVideoStudio:
                         "use H.264 by default.")
                 raise RuntimeError(f"Could not decode the selected range: {e}")
             if not frames:
-                raise RuntimeError("No frames found in the selected time range — widen start/end.")
+                raise RuntimeError(
+                    "No frames to load — widen start/end, or loosen skip_first_frames / "
+                    "select_every_nth / frame_load_cap.")
 
         # ── VHS frame controls (skip_first_frames / select_every_nth / frame_load_cap) —
-        #    applied to the decoded window. Only in the "load frames" mode; the exact-N
-        #    (target_frames) mode already picked a specific set, so these are skipped there.
-        #    select_every_nth lowers the effective fps (fewer frames over the same time).
+        #    already applied INLINE during decode (PyAV + AV1 paths), so the kept list is
+        #    exactly what the memory budget was sized for. Here we only adjust the fps for
+        #    every-nth (fewer frames over the same time) and validate something was kept.
+        #    Exact-N (target_frames) mode ignores these controls entirely.
         if n_target <= 0:
-            _skip = max(0, int(skip_first_frames))
             _nth = max(1, int(select_every_nth))
-            _cap = int(frame_load_cap) if (frame_load_cap and frame_load_cap > 0) else 0
             if decord_batch is not None:
+                # Defensive only — decord is used solely for the exact-N mode today.
+                _skip = max(0, int(skip_first_frames))
+                _cap = int(frame_load_cap) if (frame_load_cap and frame_load_cap > 0) else 0
                 if _skip:
                     decord_batch = decord_batch[_skip:]
                 if _nth > 1:
@@ -949,13 +999,7 @@ class FloyoVideoStudio:
                     decord_batch = decord_batch[:_cap]
                 _left = int(decord_batch.shape[0])
             else:
-                if _skip:
-                    frames = frames[_skip:]
-                if _nth > 1:
-                    frames = frames[::_nth]
-                if _cap:
-                    frames = frames[:_cap]
-                _left = len(frames)
+                _left = len(frames)  # skip / nth / cap already applied at decode time
             if _nth > 1 and out_fps:
                 out_fps = round(out_fps / _nth, 4)
             if _left <= 0:
