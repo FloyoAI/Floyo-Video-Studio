@@ -424,10 +424,13 @@ function setup(node) {
         const endW = getWidget(node, "end_seconds");
         const targetFpsW = getWidget(node, "target_fps");
         const targetFramesW = getWidget(node, "target_frames");
+        const skipW = getWidget(node, "skip_first_frames");
+        const nthW = getWidget(node, "select_every_nth");
+        const capW = getWidget(node, "frame_load_cap");
         const uploadW = getWidget(node, "upload");
         if (!videoW || !startW || !endW) return;
 
-        const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW, targetFramesW, _loadToken: 0 };
+        const state = { meta: { duration: 0, fps: 0, frame_count: 0 }, node, startW, endW, videoW, targetFpsW, targetFramesW, skipW, nthW, capW, _loadToken: 0 };
         node.__fvs = state;
 
         const wrap = document.createElement("div");
@@ -542,6 +545,9 @@ function setup(node) {
         wrapCb(endW, () => syncFromWidgets(state));
         if (targetFpsW) wrapCb(targetFpsW, () => refresh(state));
         if (targetFramesW) wrapCb(targetFramesW, () => refresh(state));
+        if (skipW) wrapCb(skipW, () => refresh(state));
+        if (nthW) wrapCb(nthW, () => refresh(state));
+        if (capW) wrapCb(capW, () => refresh(state));
         wrapCb(videoW, () => loadMeta(state, videoW.value));
 
         node.addDOMWidget("fvs_ui", "floyo_video_studio", wrap, { serialize: false });
@@ -698,26 +704,54 @@ function refresh(state) {
         // so the priority is visible, not a silent surprise.
         if (state.targetFpsW) { try { state.targetFpsW.disabled = tframes > 0; } catch (_) {} }
 
-        let nFrames, efps, modeHtml;
+        // Frame controls — read them so the readout matches EXACTLY what the backend
+        // produces (this panel is an estimate; the authoritative values are the video_info
+        // outputs, but they should agree to ±1 frame).
+        const skip = state.skipW ? Math.max(0, Math.floor(Number(state.skipW.value) || 0)) : 0;
+        const nth = state.nthW ? Math.max(1, Math.floor(Number(state.nthW.value) || 1)) : 1;
+        const cap = state.capW ? Math.max(0, Math.floor(Number(state.capW.value) || 0)) : 0;
+
+        let nFrames, efps, outDur, modeHtml;
         if (tframes > 0) {
+            // Exact count — the backend ignores fps + the frame controls in this mode and
+            // keeps the full trim timespan (out_fps = N / segDur), so the duration IS segDur.
             nFrames = tframes;
             efps = Math.round((tframes / segDur) * 10) / 10;
+            outDur = hi - lo;
             modeHtml = `<span class="fvs-on">Exact count</span> — fps auto (${efps}); ` +
-                       `<span class="fvs-off">target_fps ignored</span>`;
-        } else if (tfps > 0) {
-            efps = tfps;
-            nFrames = Math.max(0, Math.round(segDur * efps));
-            modeHtml = `<span class="fvs-on">Target fps</span> — frame count follows`;
+                       `<span class="fvs-off">target_fps + frame controls ignored</span>`;
         } else {
-            efps = fps;
-            nFrames = Math.max(0, fHi - fLo);
-            modeHtml = `Source fps (set target_fps or target_frames to change)`;
+            // out fps: target_fps if set, else source — CAPPED to source (can't invent
+            // frames; a higher target_fps would mislabel the same frames as faster).
+            let ofps = tfps > 0 ? tfps : fps;
+            const capped = fps > 0 && ofps > fps;
+            if (capped) ofps = fps;
+            // base frame count over the window at ofps, then VHS controls in backend order:
+            // skip_first_frames → select_every_nth (also divides fps) → frame_load_cap.
+            let base = ofps ? Math.max(0, Math.round(segDur * ofps)) : Math.max(0, fHi - fLo);
+            if (skip) base = Math.max(0, base - skip);
+            if (nth > 1) { base = Math.ceil(base / nth); ofps = ofps / nth; }
+            if (cap > 0) base = Math.min(base, cap);
+            nFrames = base;
+            // Duration from the UNROUNDED fps (matches the backend's loaded_duration =
+            // frame_count / out_fps exactly); efps is only rounded for display.
+            outDur = ofps ? nFrames / ofps : 0;
+            efps = Math.round(ofps * 100) / 100;
+            const bits = [tfps > 0
+                ? `<span class="fvs-on">Target fps</span>${capped ? ` (capped to source ${Math.round(fps * 100) / 100})` : ""}`
+                : `Source fps`];
+            const ctl = [];
+            if (skip) ctl.push(`skip ${skip}`);
+            if (nth > 1) { const os = (nth % 10 === 1 && nth % 100 !== 11) ? "st" : (nth % 10 === 2 && nth % 100 !== 12) ? "nd" : (nth % 10 === 3 && nth % 100 !== 13) ? "rd" : "th"; ctl.push(`every ${nth}${os}`); }
+            if (cap > 0) ctl.push(`cap ${cap}`);
+            if (ctl.length) bits.push(`<span class="fvs-on">${ctl.join(" · ")}</span>`);
+            modeHtml = bits.join(" · ");
         }
         state.readout.innerHTML =
             `Start <b>${fmtTime(lo)}</b> <span class="fvs-frames">(frame ${fLo})</span> → ` +
             `End <b>${fmtTime(hi)}</b> <span class="fvs-frames">(frame ${fHi})</span>` +
             `<div class="fvs-out">Output: <span class="fvs-frames">${nFrames} frames</span> · ` +
-            `<b>${efps || "—"} fps</b> · ${fmtTime(hi - lo)}</div>` +
+            `<b>${efps || "—"} fps</b> · ${fmtTime(outDur)}</div>` +
             `<div class="fvs-mode">${modeHtml}</div>`;
         state.node?.setDirtyCanvas?.(true, true);
     } catch (_) {}
