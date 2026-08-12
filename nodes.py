@@ -1095,7 +1095,13 @@ class FloyoVideoStudio:
         # loaded fps / dims / frame-count / duration off ONE wire (unpack with Floyo Video
         # Info, or any VHS Video Info node — the keys match VHS_VIDEOINFO exactly).
         loaded_dur = round(frame_count / out_fps, 4) if out_fps else 0.0
+        # The uploaded file's own name, extension stripped, so a downstream save node can
+        # build "<original name> something" without having to strip ".mp4" itself. Taken from
+        # the resolved path rather than the widget value, which can carry an "[input]"
+        # annotation. New key only: the existing ones keep matching VHS_VIDEOINFO.
+        source_filename = os.path.splitext(os.path.basename(path))[0]
         video_info = {
+            "source_filename": str(source_filename),
             "source_fps": float(src_fps),
             "source_frame_count": int(meta.get("frame_count") or 0),
             "source_duration": float(duration),
@@ -1166,11 +1172,14 @@ class FloyoVideoInfo:
         return {"required": {"video_info": ("VHS_VIDEOINFO", {"tooltip": "The video_info output from Floyo Video Studio (or a VHS Load Video)."})}}
 
     RETURN_TYPES = ("FLOAT", "INT", "FLOAT", "INT", "INT",
-                    "FLOAT", "INT", "FLOAT", "INT", "INT")
+                    "FLOAT", "INT", "FLOAT", "INT", "INT", "STRING")
     # Friendly, non-technical labels. "Default …" = the uploaded video, as-is.
     # "Output …" = what comes out of Floyo Video Studio (after trim / resize / fps).
+    # Appended, never inserted: an output added in the middle would shift every link index
+    # after it and quietly rewire saved workflows.
     RETURN_NAMES = ("Default FPS", "Default Frames", "Default Duration", "Default Width", "Default Height",
-                    "Output FPS", "Output Frames", "Output Duration", "Output Width", "Output Height")
+                    "Output FPS", "Output Frames", "Output Duration", "Output Width", "Output Height",
+                    "Source Filename")
     OUTPUT_TOOLTIPS = (
         "The uploaded video's frames-per-second (before any changes).",
         "The uploaded video's total number of frames.",
@@ -1182,6 +1191,8 @@ class FloyoVideoInfo:
         "Length of the output, in seconds.",
         "Width of the output, in pixels.",
         "Height of the output, in pixels.",
+        "The uploaded video's file name without its extension, so it can be reused in an output "
+        "file name (bedroom.mp4 comes out as bedroom).",
     )
     FUNCTION = "run"
     CATEGORY = "Floyo/Video"
@@ -1199,6 +1210,7 @@ class FloyoVideoInfo:
             int(g("source_width")), int(g("source_height")),
             float(g("loaded_fps")), int(g("loaded_frame_count")), float(g("loaded_duration")),
             int(g("loaded_width")), int(g("loaded_height")),
+            str(g("source_filename", "")),
         )
 
 
